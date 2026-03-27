@@ -52,6 +52,11 @@ const AMENDMENT_CHALLENGE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days amendment ch
 const MAX_AMENDMENT_REASON_LENGTH: u32 = 1000; // Maximum amendment reason length
 const MIN_RAGE_QUIT_VESTED_PERCENTAGE: u32 = 1000; // 10% minimum vested percentage for rage quit
 
+// Tax Jurisdiction constants
+const MAX_JURISDICTION_CODE_LENGTH: u32 = 10; // Maximum jurisdiction code length (e.g., "US-CA", "GB-LDN")
+const DEFAULT_TAX_WITHHOLDING_RATE: u32 = 0; // 0% default withholding rate (in basis points)
+const MAX_TAX_WITHHOLDING_RATE: u32 = 5000; // 50% maximum withholding rate (in basis points)
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -379,6 +384,45 @@ pub struct AmendmentAppeal {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct JurisdictionInfo {
+    pub code: String,           // Jurisdiction code (e.g., "US-CA", "GB-LDN")
+    pub name: String,           // Human-readable name
+    pub tax_withholding_rate: u32, // Tax rate in basis points (1/100 of percent)
+    pub tax_treaty_eligible: bool, // Whether tax treaty benefits apply
+    pub documentation_required: bool, // Whether additional documentation is required
+    pub updated_at: u64,        // Last update timestamp
+    pub updated_by: Address,    // Who updated this jurisdiction
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeRecord {
+    pub address: Address,           // Grantee's wallet address
+    pub jurisdiction_code: String,   // Tax jurisdiction code
+    pub tax_id: Option<String>,      // Tax identifier (SSN, EIN, etc.)
+    pub tax_treaty_claimed: bool,    // Whether tax treaty benefits are claimed
+    pub verified: bool,              // Whether jurisdiction information is verified
+    pub verification_documents: Option<[u8; 32]>, // Hash of verification documents
+    pub created_at: u64,             // Record creation timestamp
+    pub updated_at: u64,             // Last update timestamp
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct TaxWithholdingRecord {
+    pub grant_id: u64,               // Associated grant ID
+    pub grantee: Address,            // Grantee address
+    pub gross_amount: i128,          // Gross payment amount
+    pub tax_rate: u32,               // Tax withholding rate (basis points)
+    pub tax_withheld: i128,          // Amount withheld for taxes
+    pub net_amount: i128,            // Net amount paid to grantee
+    pub jurisdiction_code: String,   // Jurisdiction used for calculation
+    pub payment_date: u64,           // Payment timestamp
+    pub tax_report_id: Option<u64>,  // Reference to tax report
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Grant {
     pub recipient: Address,
     pub total_amount: i128,
@@ -669,6 +713,12 @@ enum DataKey {
     AmendmentIds, // List of all amendment IDs
     NextAmendmentId, // Next available amendment ID
     AmendmentAppeal(u64), // Maps amendment_id to appeal details
+    // Tax Jurisdiction keys
+    JurisdictionRegistry(String), // Maps jurisdiction code to tax rate
+    JurisdictionCodes, // List of all jurisdiction codes
+    GranteeJurisdiction(Address), // Maps grantee address to jurisdiction code
+    TaxWithholdingReserve, // Reserve for tax withholding funds
+    JurisdictionRegistryContract, // Address of jurisdiction registry contract
 }
 
 #[contracterror]
@@ -758,6 +808,13 @@ pub enum Error {
     InsufficientVestedFunds = 71,
     AmendmentNotChallenged = 72,
     InvalidAmendmentReason = 73,
+    // Tax Jurisdiction errors
+    JurisdictionNotFound = 74,
+    JurisdictionAlreadyExists = 75,
+    InvalidJurisdictionCode = 76,
+    InvalidTaxRate = 77,
+    JurisdictionRegistryNotSet = 78,
+    TaxWithholdingFailed = 79,
 }
 
 // --- Internal Helpers ---
@@ -4008,6 +4065,295 @@ pub mod grant {
         
         Ok(grant_amendments)
     }
+
+    // --- Tax Jurisdiction Functions ---
+
+    /// Register a new tax jurisdiction (admin only)
+    /// 
+    /// This function allows the DAO to register a new tax jurisdiction with its
+    /// corresponding tax withholding rate. This makes Grant-Stream tax-native.
+    /// 
+    /// # Arguments
+    /// * `code` - Jurisdiction code (e.g., "US-CA", "GB-LDN")
+    /// * `name` - Human-readable jurisdiction name
+    /// * `tax_withholding_rate` - Tax rate in basis points (1/100 of percent)
+    /// * `tax_treaty_eligible` - Whether tax treaty benefits apply
+    /// * `documentation_required` - Whether additional documentation is required
+    pub fn register_jurisdiction(
+        env: Env,
+        code: String,
+        name: String,
+        tax_withholding_rate: u32,
+        tax_treaty_eligible: bool,
+        documentation_required: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        // Validate inputs
+        if code.len() > MAX_JURISDICTION_CODE_LENGTH as usize {
+            return Err(Error::InvalidJurisdictionCode);
+        }
+        if tax_withholding_rate > MAX_TAX_WITHHOLDING_RATE {
+            return Err(Error::InvalidTaxRate);
+        }
+
+        // Check if jurisdiction already exists
+        if env.storage().instance().has(&DataKey::JurisdictionRegistry(code.clone())) {
+            return Err(Error::JurisdictionAlreadyExists);
+        }
+
+        let jurisdiction = JurisdictionInfo {
+            code: code.clone(),
+            name,
+            tax_withholding_rate,
+            tax_treaty_eligible,
+            documentation_required,
+            updated_at: env.ledger().timestamp(),
+            updated_by: env.current_contract_address(),
+        };
+
+        // Store jurisdiction
+        env.storage().instance().set(&DataKey::JurisdictionRegistry(code.clone()), &jurisdiction);
+        
+        // Add to jurisdiction codes list
+        let mut jurisdiction_codes = read_jurisdiction_codes(&env);
+        jurisdiction_codes.push_back(code.clone());
+        env.storage().instance().set(&DataKey::JurisdictionCodes, &jurisdiction_codes);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("jurisdiction_registered"),),
+            (code, jurisdiction.tax_withholding_rate),
+        );
+
+        Ok(())
+    }
+
+    /// Update an existing tax jurisdiction (admin only)
+    pub fn update_jurisdiction(
+        env: Env,
+        code: String,
+        name: Option<String>,
+        tax_withholding_rate: Option<u32>,
+        tax_treaty_eligible: Option<bool>,
+        documentation_required: Option<bool>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        // Validate tax rate if provided
+        if let Some(rate) = tax_withholding_rate {
+            if rate > MAX_TAX_WITHHOLDING_RATE {
+                return Err(Error::InvalidTaxRate);
+            }
+        }
+
+        let mut jurisdiction = read_jurisdiction(&env, &code)?;
+
+        // Update fields if provided
+        if let Some(new_name) = name {
+            jurisdiction.name = new_name;
+        }
+        if let Some(new_rate) = tax_withholding_rate {
+            jurisdiction.tax_withholding_rate = new_rate;
+        }
+        if let Some(eligible) = tax_treaty_eligible {
+            jurisdiction.tax_treaty_eligible = eligible;
+        }
+        if let Some(doc_required) = documentation_required {
+            jurisdiction.documentation_required = doc_required;
+        }
+        
+        jurisdiction.updated_at = env.ledger().timestamp();
+        jurisdiction.updated_by = env.current_contract_address();
+
+        // Store updated jurisdiction
+        env.storage().instance().set(&DataKey::JurisdictionRegistry(code.clone()), &jurisdiction);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("jurisdiction_updated"),),
+            (code, jurisdiction.tax_withholding_rate),
+        );
+
+        Ok(())
+    }
+
+    /// Register or update a grantee's tax jurisdiction information
+    /// 
+    /// This function allows grantees to specify their tax jurisdiction for
+    /// proper tax withholding calculations.
+    /// 
+    /// # Arguments
+    /// * `grantee_address` - The grantee's wallet address
+    /// * `jurisdiction_code` - Tax jurisdiction code
+    /// * `tax_id` - Optional tax identifier (SSN, EIN, etc.)
+    /// * `tax_treaty_claimed` - Whether tax treaty benefits are claimed
+    /// * `verification_documents` - Optional hash of verification documents
+    pub fn register_grantee_jurisdiction(
+        env: Env,
+        grantee_address: Address,
+        jurisdiction_code: String,
+        tax_id: Option<String>,
+        tax_treaty_claimed: bool,
+        verification_documents: Option<[u8; 32]>,
+    ) -> Result<(), Error> {
+        // Validate caller is the grantee or admin
+        if env.current_contract_address() != grantee_address {
+            require_admin_auth(&env)?;
+        }
+
+        // Validate jurisdiction exists
+        let jurisdiction = read_jurisdiction(&env, &jurisdiction_code)?;
+
+        let record = GranteeRecord {
+            address: grantee_address.clone(),
+            jurisdiction_code,
+            tax_id,
+            tax_treaty_claimed,
+            verified: verification_documents.is_some(),
+            verification_documents,
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+        };
+
+        // Store grantee record
+        env.storage().instance().set(&DataKey::GranteeJurisdiction(grantee_address.clone()), &record);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("grantee_jurisdiction_registered"),),
+            (grantee_address, record.jurisdiction_code),
+        );
+
+        Ok(())
+    }
+
+    /// Calculate tax withholding for a payment
+    /// 
+    /// This function calculates the appropriate tax withholding amount based on
+    /// the grantee's jurisdiction and applicable tax treaties.
+    /// 
+    /// # Arguments
+    /// * `grantee_address` - The grantee's wallet address
+    /// * `gross_amount` - The gross payment amount
+    /// 
+    /// # Returns
+    /// * `(i128, i128, u32)` - (tax_withheld, net_amount, tax_rate)
+    pub fn calculate_tax_withholding(
+        env: Env,
+        grantee_address: Address,
+        gross_amount: i128,
+    ) -> Result<(i128, i128, u32), Error> {
+        // Get grantee's jurisdiction record
+        let record = read_grantee_record(&env, &grantee_address)?;
+        let jurisdiction = read_jurisdiction(&env, &record.jurisdiction_code)?;
+
+        // Calculate tax rate based on jurisdiction and treaty status
+        let mut tax_rate = jurisdiction.tax_withholding_rate;
+        
+        // Apply tax treaty reduction if eligible and claimed
+        if jurisdiction.tax_treaty_eligible && record.tax_treaty_claimed {
+            // Example: Reduce tax rate by 50% for treaty beneficiaries
+            tax_rate = tax_rate / 2;
+        }
+
+        // Calculate tax amounts
+        let tax_withheld = (gross_amount * tax_rate as i128) / 10000;
+        let net_amount = gross_amount - tax_withheld;
+
+        Ok((tax_withheld, net_amount, tax_rate))
+    }
+
+    /// Process a payment with tax withholding
+    /// 
+    /// This function processes a payment to a grantee, withholding the appropriate
+    /// amount for taxes based on their jurisdiction.
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The associated grant ID
+    /// * `grantee_address` - The grantee's wallet address
+    /// * `gross_amount` - The gross payment amount
+    /// * `token_address` - The token address for payment
+    /// 
+    /// # Returns
+    /// * `u64` - The tax withholding record ID
+    pub fn process_payment_with_tax(
+        env: Env,
+        grant_id: u64,
+        grantee_address: Address,
+        gross_amount: i128,
+        token_address: Address,
+    ) -> Result<u64, Error> {
+        // Calculate tax withholding
+        let (tax_withheld, net_amount, tax_rate) = calculate_tax_withholding(&env, grantee_address.clone(), gross_amount)?;
+        
+        // Get jurisdiction code for record
+        let record = read_grantee_record(&env, &grantee_address)?;
+        let jurisdiction_code = record.jurisdiction_code.clone();
+
+        // Create tax withholding record
+        let tax_record_id = env.ledger().sequence; // Use ledger sequence as ID
+        let tax_record = TaxWithholdingRecord {
+            grant_id,
+            grantee: grantee_address.clone(),
+            gross_amount,
+            tax_rate,
+            tax_withheld,
+            net_amount,
+            jurisdiction_code,
+            payment_date: env.ledger().timestamp(),
+            tax_report_id: None,
+        };
+
+        // Store tax record (using grant_id + timestamp as key for simplicity)
+        // Note: In production, you'd want a more sophisticated key system
+        env.storage().instance().set(&DataKey::FinancialSnapshot(grant_id, tax_record_id), &tax_record);
+
+        // Transfer net amount to grantee
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &grantee_address, &net_amount);
+
+        // Move tax amount to withholding reserve
+        if tax_withheld > 0 {
+            token_client.transfer(&env.current_contract_address(), &read_tax_withholding_reserve(&env)?, &tax_withheld);
+        }
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("payment_with_tax_processed"),),
+            (grant_id, grantee_address, gross_amount, tax_withheld, net_amount),
+        );
+
+        Ok(tax_record_id)
+    }
+
+    /// Get jurisdiction information
+    pub fn get_jurisdiction(env: Env, code: String) -> Result<JurisdictionInfo, Error> {
+        read_jurisdiction(&env, &code)
+    }
+
+    /// Get all registered jurisdictions
+    pub fn get_all_jurisdictions(env: Env) -> Result<Vec<String>, Error> {
+        Ok(read_jurisdiction_codes(&env))
+    }
+
+    /// Get grantee's tax record
+    pub fn get_grantee_record(env: Env, grantee_address: Address) -> Result<GranteeRecord, Error> {
+        read_grantee_record(&env, &grantee_address)
+    }
+
+    /// Set tax withholding reserve address (admin only)
+    pub fn set_tax_withholding_reserve(env: Env, reserve_address: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        env.storage().instance().set(&DataKey::TaxWithholdingReserve, &reserve_address);
+        
+        env.events().publish(
+            (symbol_short!("tax_reserve_set"),),
+            reserve_address,
+        );
+        
+        Ok(())
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -4162,6 +4508,32 @@ fn create_amendment_appeal(env: &Env, amendment: &GrantAmendment, reason: &str) 
 fn get_next_appeal_id(env: &Env) -> u64 {
     // Simple implementation - in production this would be more sophisticated
     env.ledger().sequence
+}
+
+// --- Tax Jurisdiction Helper Functions ---
+
+fn read_jurisdiction(env: &Env, code: &str) -> Result<JurisdictionInfo, Error> {
+    env.storage().instance()
+        .get(&DataKey::JurisdictionRegistry(String::from_str_slice(env, code)))
+        .ok_or(Error::JurisdictionNotFound)
+}
+
+fn read_jurisdiction_codes(env: &Env) -> Vec<String> {
+    env.storage().instance()
+        .get(&DataKey::JurisdictionCodes)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_grantee_record(env: &Env, grantee_address: &Address) -> Result<GranteeRecord, Error> {
+    env.storage().instance()
+        .get(&DataKey::GranteeJurisdiction(grantee_address))
+        .ok_or(Error::JurisdictionNotFound)
+}
+
+fn read_tax_withholding_reserve(env: &Env) -> Result<Address, Error> {
+    env.storage().instance()
+        .get(&DataKey::TaxWithholdingReserve)
+        .ok_or(Error::JurisdictionRegistryNotSet)
 }
 
 #[cfg(test)]
