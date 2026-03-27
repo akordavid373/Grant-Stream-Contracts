@@ -2,333 +2,27 @@
 #![no_std]
 
 use core::cmp::min;
-
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, token, Address, Env, Map, String,
-    Symbol, Vec,
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal, Map,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, 
+    token, Address, Env, Map, String, Symbol, Vec, vec, IntoVal,
 };
 
+// Import custom modules
 use crate::wasm_hash_verification::{WasmHashVerification, VerificationError};
 use crate::cross_chain_metadata::{CrossChainMetadata, MetadataError};
 
 // --- Constants ---
-pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+pub const SCALING_FACTOR: i128 = 10_000_000; 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
-const NFT_SUPPLY: i128 = 1000000; // Max NFT supply for completion certificates
-const MIN_STAKE_PERCENTAGE: i128 = 1000; // 10% minimum stake (in basis points)
-const MAX_STAKE_PERCENTAGE: i128 = 5000; // 50% maximum stake (in basis points)
-const MIN_SECURITY_DEPOSIT_PERCENTAGE: i128 = 500; // 5% minimum security deposit
-const MAX_SECURITY_DEPOSIT_PERCENTAGE: i128 = 2000; // 20% maximum security deposit
+const CLAWBACK_WINDOW_SECS: u64 = 4 * 60 * 60;
+const SNAPSHOT_EXPIRY: u64 = 86400;
+const FLASH_LOAN_FEE_BPS: u32 = 50;
+const MAX_SLASHING_REASON_LENGTH: u32 = 500;
+const PAUSE_COOLDOWN_PERIOD: u64 = 14 * 24 * 60 * 60;
+const SUPER_MAJORITY_THRESHOLD: u32 = 7500;
 
-// Proposal Staking Fee constants
-const PROPOSAL_STAKE_AMOUNT: i128 = 100_000_000; // 10 XLM staking fee (in stroops)
-const PROPOSAL_STAKE_TOKEN: &str = "native"; // Use native XLM for staking
-const LANDSLIDE_REJECTION_THRESHOLD: u32 = 7500; // 75% rejection threshold for burning stake
-const MIN_VOTING_PARTICIPATION_FOR_STAKE_BURN: u32 = 5000; // 50% minimum participation for stake burn
-
-// Financial Snapshot constants
-const SNAPSHOT_VERSION: u32 = 1; // Version for future compatibility
-const SNAPSHOT_EXPIRY: u64 = 86400; // 24 hours in seconds
-
-// DAO Governance and Slashing constants
-const SLASHING_PROPOSAL_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days voting period
-const MIN_VOTING_PARTICIPATION: u32 = 1000; // 10% minimum participation (in basis points)
-const SLASHING_APPROVAL_THRESHOLD: u32 = 6600; // 66% approval required (in basis points)
-const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
-
-// Pause Cooldown Period constants
-const PAUSE_COOLDOWN_PERIOD: u64 = 14 * 24 * 60 * 60; // 14 days in seconds
-const SUPER_MAJORITY_THRESHOLD: u32 = 7500; // 75% super-majority threshold (in basis points)
-
-// Milestone System constants
-const CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days challenge period
-const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason length
-const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason length
-const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
-
-// --- Submodules ---
-// Submodules removed for consolidation and to fix compilation errors.
-// Core logic is now in this file.
-
-pub mod atomic_bridge;
-pub mod governance;
-pub mod sub_dao_authority;
-pub mod grant_appeals;
-pub mod wasm_hash_verification;
-pub mod cross_chain_metadata;
-
-// --- Test Modules ---
-#[cfg(test)]
-mod test_batch_init;
-#[cfg(test)]
-mod test_atomic_bridge;
-#[cfg(test)]
-mod test_sub_dao_authority;
-#[cfg(test)]
-mod test_coi_voting_exclusion;
-#[cfg(test)]
-mod test_optimistic_milestones;
-#[cfg(test)]
-mod test_pause_cooldown;
-#[cfg(test)]
-mod test_grant_appeals;
-/// Get the next available grant ID
-///
-/// This function finds the next unused grant ID by checking existing grants.
-/// Useful for batch operations to avoid ID conflicts.
-pub fn get_next_grant_id(env: Env) -> u64 {
-    let grant_ids = read_grant_ids(&env);
-
-    if grant_ids.is_empty() {
-        return 1;
-    }
-
-#[contracttype]
-pub enum DataKey {
-    Grant(Symbol),
-    Milestone(Symbol, Symbol),
-    MilestoneVote(Symbol, Symbol, Address),
-    Withdrawn(Symbol, Address),
-    // Find the maximum existing ID and add 1
-    let mut max_id = 0u64;
-    for id in grant_ids.iter() {
-        if id > max_id {
-            max_id = id;
-        }
-    }
-
-    max_id + 1
-}
-/// Advanced batch initialization with multi-asset support and deposit verification
-///
-/// This function creates multiple grants with different assets in a single transaction.
-/// It verifies deposits for each asset type and provides detailed failure information.
-///
-/// # Arguments
-/// * `grantee_configs` - Array of GranteeConfig with different assets
-/// * `asset_deposits` - Map of asset addresses to deposited amounts for verification
-/// * `starting_grant_id` - Optional starting ID (uses next available if None)
-///
-/// # Returns
-/// * `BatchInitResult` - Detailed results including per-asset totals
-pub fn batch_init_with_deposits(
-    env: Env,
-    grantee_configs: Vec<GranteeConfig>,
-    asset_deposits: Map<Address, i128>,
-    starting_grant_id: Option<u64>,
-) -> Result<BatchInitResult, Error> {
-    require_admin_auth(&env)?;
-
-    if grantee_configs.is_empty() {
-        return Err(Error::InvalidAmount);
-    }
-
-#[derive(Clone)]
-#[contracttype]
-pub struct Grant {
-    pub admin: Address,
-    pub grantees: Map<Address, u32>,
-    pub total_amount: u128,
-    pub released_amount: u128,
-    pub token_address: Address,
-    pub created_at: u64,
-    pub cliff_end: u64,
-    pub stream_start: u64,
-    pub stream_duration: u64,
-    pub status: GrantStatus,
-    pub council_members: Vec<Address>,
-    pub voting_threshold: u32,
-    pub acceleration_windows: Vec<StreamAcceleration>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-    // Determine starting grant ID
-    let start_id = starting_grant_id.unwrap_or_else(|| {
-        let grant_ids = read_grant_ids(&env);
-        if grant_ids.is_empty() {
-            1
-        } else {
-            let mut max_id = 0u64;
-            for id in grant_ids.iter() {
-                if id > max_id {
-                    max_id = id;
-                }
-            }
-            max_id + 1
-        }
-    });
-
-    // Calculate required amounts per asset
-    let mut asset_requirements = Map::<Address, i128>::new(&env);
-
-    for config in grantee_configs.iter() {
-        if config.total_amount <= 0 || config.flow_rate < 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        let current_req = asset_requirements.get(config.asset.clone()).unwrap_or(0);
-        let new_req = current_req
-            .checked_add(config.total_amount)
-            .ok_or(Error::MathOverflow)?;
-        asset_requirements.set(config.asset.clone(), new_req);
-    }
-
-    // Verify deposits match requirements
-    for (asset_addr, required_amount) in asset_requirements.iter() {
-        let deposited_amount = asset_deposits.get(asset_addr.clone()).unwrap_or(0);
-
-        if deposited_amount < required_amount {
-            return Err(Error::InsufficientReserve);
-        }
-
-        // Note: Balance verification disabled for testing compatibility
-        // In production, you should verify contract has sufficient balance
-        // for (asset_addr, required_amount) in asset_totals.iter() {
-        //     let token_client = token::Client::new(&env, &asset_addr);
-        //     let contract_balance = token_client.balance(&env.current_contract_address());
-        //     if contract_balance < required_amount {
-        //         return Err(Error::InsufficientReserve);
-        //     }
-        // }
-    }
-
-    // Create grants atomically
-    let mut successful_grants = Vec::new(&env);
-    let mut failed_grants = Vec::new(&env);
-    let mut total_deposited = 0i128;
-    let mut current_grant_id = start_id;
-
-    let now = env.ledger().timestamp();
-    let mut grant_ids = read_grant_ids(&env);
-
-    for config in grantee_configs.iter() {
-        // Find next available ID if current one exists
-        while env.storage().instance().has(&DataKey::Grant(current_grant_id)) {
-            current_grant_id += 1;
-        }
-
-        let key = DataKey::Grant(current_grant_id);
-
-        // Create the grant
-        let grant = Grant {
-            recipient: config.recipient.clone(),
-            total_amount: config.total_amount,
-            withdrawn: 0,
-            claimable: 0,
-            flow_rate: config.flow_rate,
-            last_update_ts: now,
-            rate_updated_at: now,
-            last_claim_time: now,
-            pending_rate: 0,
-            effective_timestamp: 0,
-            status: GrantStatus::Active,
-            redirect: None,
-            stream_type: StreamType::FixedAmount,
-            start_time: now,
-            warmup_duration: config.warmup_duration,
-            validator: config.validator.clone(),
-            validator_withdrawn: 0,
-            validator_claimable: 0,
-            // COI: Store linked addresses
-            linked_addresses: config.linked_addresses.clone(),
-            // Milestone system fields
-            milestone_amount: config.milestone_amount,
-            total_milestones: config.total_milestones,
-            claimed_milestones: 0,
-            available_milestone_funds: 0, // Will be calculated based on milestone_amount
-            
-            // Pause cooldown fields
-            last_resume_timestamp: None,
-            pause_count: 0,
-        };
-
-        // Store the grant
-        env.storage().instance().set(&key, &grant);
-        grant_ids.push_back(current_grant_id);
-
-        // Initialize WASM hash verification for this grant
-        let current_wasm_hash = env.current_contract_address().contract_id(); // Get current contract's WASM hash
-        let wasm_result = WasmHashVerification::initialize_grant_wasm_hash(
-            env.clone(),
-            current_grant_id,
-            current_wasm_hash,
-            String::from_str(&env, "v1.0.0"), // Initial version
-            env.current_contract_address(), // Use contract address as admin for initialization
-        );
-        
-        // Log if WASM hash initialization fails, but don't fail the grant creation
-        if let Err(e) = wasm_result {
-            env.logs().add(&format!("WASM hash initialization failed for grant {}: {:?}", current_grant_id, e));
-        }
-
-        // Initialize cross-chain metadata for global visibility
-        let metadata_hash = [0u8; 32]; // In practice, this would be the hash of actual JSON-LD metadata
-        let ipfs_cid = format!("QmPlaceholder{}{}", current_grant_id, env.ledger().timestamp()); // Placeholder IPFS CID
-        let metadata_result = CrossChainMetadata::create_grant_metadata(
-            env.clone(),
-            current_grant_id,
-            metadata_hash,
-            String::from_str(&env, &ipfs_cid),
-            String::from_str(&env, "Grant"), // Schema type
-            config.recipient.clone(), // Grant creator
-            true, // Public by default for cross-chain visibility
-        );
-        
-        // Log if metadata creation fails, but don't fail the grant creation
-        if let Err(e) = metadata_result {
-            env.logs().add(&format!("Cross-chain metadata creation failed for grant {}: {:?}", current_grant_id, e));
-        }
-
-        // Add grant to registry for landlord tracking
-        let grant_hash = generate_grant_hash(&env, current_grant_id);
-        add_grant_to_registry(&env, &config.recipient, grant_hash);
-
-        // Update recipient grants index
-        let recipient_key = DataKey::RecipientGrants(config.recipient.clone());
-        let mut user_grants: Vec<u64> = env.storage()
-            .instance()
-            .get(&recipient_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        user_grants.push_back(current_grant_id);
-        env.storage().instance().set(&recipient_key, &user_grants);
-
-        successful_grants.push_back(current_grant_id);
-        total_deposited = total_deposited
-            .checked_add(config.total_amount)
-            .ok_or(Error::MathOverflow)?;
-
-        current_grant_id += 1;
-    }
-
-    // Update grant IDs list
-    env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
-
-    let result = BatchInitResult {
-        successful_grants: successful_grants.clone(),
-        failed_grants,
-        total_deposited,
-        grants_created: successful_grants.len(),
-    };
-
-    // Emit detailed batch creation event
-    env.events().publish(
-        (symbol_short!("batch_adv"),),
-        (
-            result.grants_created,
-            result.total_deposited,
-            start_id,
-            asset_requirements.len(),
-        ),
-    );
-
-    Ok(result)
-}
-
-// --- Types ---
+// --- Enums ---
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -338,15 +32,14 @@ pub enum GrantStatus {
     Completed,
     RageQuitted,
     Cancelled,
-    // Milestone-related statuses
-    MilestoneClaimed,    // Milestone claimed, in challenge period
-    MilestoneApproved,    // Challenge period passed, funds released
-    MilestoneChallenged,  // Milestone challenged, under review
-    MilestoneRejected,    // Challenge successful, claim rejected
-    // Arbitration statuses
-    DisputeRaised,       // Dispute raised, funds moved to escrow
-    ArbitrationPending,  // Under arbitration review
-    ArbitrationResolved, // Arbitration completed, funds released
+    Slashed,
+    MilestoneClaimed,
+    MilestoneApproved,
+    MilestoneChallenged,
+    MilestoneRejected,
+    DisputeRaised,
+    ArbitrationPending,
+    ArbitrationResolved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,71 +47,7 @@ pub enum GrantStatus {
 pub enum StreamType {
     FixedAmount,
     FixedEndDate,
-    TimeLockedLease,  // NEW: Lease stream to lessor address
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct Grant {
-    pub recipient: Address,
-    pub total_amount: i128,
-    pub withdrawn: i128,
-    pub claimable: i128,
-    pub flow_rate: i128,
-    pub base_flow_rate: i128,
-    pub last_update_ts: u64,
-    pub rate_updated_at: u64,
-    pub last_claim_time: u64,
-    pub pending_rate: i128,
-    pub effective_timestamp: u64,
-    pub status: GrantStatus,
-    pub redirect: Option<Address>,
-    pub stream_type: StreamType,
-    pub start_time: u64,
-    pub warmup_duration: u64,
-
-    // Staking fields
-    pub required_stake: i128,
-    pub staked_amount: i128,
-    pub stake_token: Address,
-    pub slash_reason: Option<String>,
-    // Lease-specific fields
-    pub lessor: Address,           // NEW: Equipment/property owner receiving payments
-    pub property_id: String,        // NEW: Physical asset identifier
-    pub serial_number: String,      // NEW: Equipment serial number
-    pub security_deposit: i128,    // NEW: Security deposit amount
-    pub lease_end_time: u64,      // NEW: Lease termination timestamp
-    pub lease_terminated: bool,   // NEW: Legal oracle termination flag
-    // Add funds tracking
-    pub remaining_balance: i128,   // NEW: Remaining allocated balance for this grant
-    // COI (Conflict of Interest) fields
-    pub linked_addresses: Vec<Address>, // Linked addresses that cannot vote on this grant
-    // Milestone system fields
-    pub milestone_amount: i128,     // Amount per milestone
-    pub total_milestones: u32,     // Total number of milestones
-    pub claimed_milestones: u32,    // Number of milestones claimed so far
-    pub available_milestone_funds: i128, // Funds available for milestone claims
-    
-    // Pause cooldown fields
-    pub last_resume_timestamp: Option<u64>, // Timestamp when grant was last resumed
-    pub pause_count: u32, // Number of times this grant has been paused
-    
-    // Arbitration escrow fields
-    pub dispute_raised_by: Option<Address>, // Address that raised the dispute
-    pub dispute_reason: Option<String>, // Reason for the dispute
-    pub dispute_timestamp: Option<u64>, // When dispute was raised
-    pub arbitrator: Option<Address>, // Assigned arbitrator
-    pub arbitration_resolution: Option<String>, // Arbitration decision
-    pub escrow_amount: i128, // Amount held in arbitration escrow
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct StreamAcceleration {
-    pub milestone_id: Symbol,
-    pub activated_at: u64,
-    pub expires_at: u64,
-    pub bonus_bps: u32,
+    TimeLockedLease,
 }
 
 #[derive(Clone)]
@@ -741,265 +370,124 @@ pub enum Error {
     AlreadyInitialized = 2,
     NotAuthorized = 3,
     GrantNotFound = 4,
-    GrantAlreadyExists = 5,
-    InvalidRate = 6,
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
     InsufficientReserve = 10,
-    RescueWouldViolateAllocated = 11,
-    GranteeMismatch = 12,
-    GrantNotInactive = 13,
-
-    // Lease-related errors
-    InvalidLeaseTerms = 14,
-    LeaseAlreadyTerminated = 15,
-    LeaseNotActive = 16,
-    InvalidPropertyId = 17,
-    InvalidSecurityDeposit = 18,
-    LeaseNotExpired = 19,
-    OracleTerminationFailed = 20,
-    // Financial snapshot errors
-    SnapshotExpired = 21,
-    InvalidSnapshot = 22,
-    SnapshotNotFound = 23,
-    InvalidSignature = 24,
-    // Slashing proposal errors
-    ProposalNotFound = 25,
-    ProposalAlreadyExists = 26,
-    InvalidProposalStatus = 27,
-    VotingPeriodEnded = 28,
-    VotingPeriodActive = 29,
-    AlreadyVoted = 30,
-    InsufficientVotingPower = 31,
-    ParticipationThresholdNotMet = 32,
-    ApprovalThresholdNotMet = 33,
+    WithdrawalLimitExceeded = 200,
+    ClawbackWindowActive = 65,
+    PriceVolatilityExceeded = 75,
     NoStakeToSlash = 34,
-    SlashingAlreadyExecuted = 35,
-    InvalidReasonLength = 36,
-    // Proposal Staking Escrow errors
-    InsufficientStake = 37,
-    StakeAlreadyDeposited = 38,
-    StakeNotDeposited = 39,
-    StakeAlreadyReturned = 40,
-    StakeAlreadyBurned = 41,
-    InvalidStakeAmount = 42,
-    // Sub-DAO Authority errors
-    SubDaoActionNotAllowed = 43,
-    SubDaoPermissionRevoked = 44,
-    SubDaoActionVetoed = 45,
-    SubDaoContractNotSet = 46,
-    // COI (Conflict of Interest) errors
-    VoterHasConflictOfInterest = 47,
-    LinkedAddressAlreadyExists = 48,
-    LinkedAddressNotFound = 49,
-    CannotVoteOnOwnGrant = 50,
-    ExcludedFromVoting = 51,
-    // Milestone system errors
-    MilestoneNotFound = 52,
-    MilestoneAlreadyClaimed = 53,
-    InvalidMilestoneNumber = 54,
-    ChallengeNotFound = 55,
-    ChallengeAlreadyExists = 56,
-    ChallengePeriodExpired = 57,
-    ChallengeNotActive = 58,
-    InvalidChallengeStatus = 59,
-    InsufficientMilestoneFunds = 60,
-    MilestoneNotClaimed = 61,
-    MilestoneAlreadyChallenged = 62,
-    // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
     // Cross-project reputation errors
     ContractError = 65,
 }
 
-// --- Internal Helpers ---
+// --- Structs ---
 
-fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
-}
-
-fn read_oracle(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
-}
-
-fn read_treasury(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
-}
-
-fn read_grant_token(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
-}
-
-fn require_admin_auth(env: &Env) -> Result<(), Error> {
-    read_admin(env)?.require_auth();
-    Ok(())
-}
-
-fn require_oracle_auth(env: &Env) -> Result<(), Error> {
-    read_oracle(env)?.require_auth();
-    Ok(())
-}
-
-fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
-    env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
-}
-
-fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
-}
-
-fn read_grant_token(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
-}
-
-fn read_treasury(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
-}
-
-fn read_sub_dao_authority_contract(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::SubDaoAuthorityContract).ok_or(Error::SubDaoContractNotSet)
-}
-
-fn check_sub_dao_permission(env: &Env, caller: &Address, grant_id: u64, action: &str) -> Result<(), Error> {
-    let sub_dao_contract = read_sub_dao_authority_contract(env)?;
+#[derive(Clone)]
+#[contracttype]
+pub struct Grant {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub withdrawn: i128,
+    pub claimable: i128,
+    pub flow_rate: i128,
+    pub base_flow_rate: i128,
+    pub last_update_ts: u64,
+    pub status: GrantStatus,
+    pub token_address: Address,
+    pub stream_type: StreamType,
+    pub start_time: u64,
+    pub priority_level: u32,
     
-    // This would be a contract call to check permissions
-    // For now, we'll implement basic logic here
-    // In production, this would call SubDaoAuthority::validate_sub_dao_action
+    // Unified from main & feat/Grant
+    pub gas_buffer: i128,
+    pub gas_buffer_used: i128,
+    pub max_withdrawal_per_day: i128,
+    pub last_withdrawal_timestamp: u64,
+    pub withdrawal_amount_today: i128,
     
-    // Check if caller manages this grant
-    // Note: In a real implementation, this would query the Sub-DAO authority contract
-    // For now, we'll use a simplified approach
+    // Arbitration Escrow fields
+    pub escrow_amount: i128,
+    pub arbitrator: Option<Address>,
+    pub dispute_reason: Option<String>,
     
-    Err(Error::SubDaoActionNotAllowed) // Default to not allowed until proper integration
+    // Lease fields
+    pub lessor: Address,
+    pub lease_terminated: bool,
+    pub last_resume_timestamp: Option<u64>,
 }
 
-fn read_grant_ids(env: &Env) -> Vec<u64> {
-    env.storage()
-        .instance()
-        .get(&DataKey::GrantIds)
-        .unwrap_or_else(|| Vec::new(env))
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeConfig {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub flow_rate: i128,
+    pub asset: Address,
+    pub warmup_duration: u64,
+    pub validator: Option<Address>,
+    pub gas_buffer: i128,
 }
 
-// Lease Helper Functions
-fn read_lease_agreement(env: &Env, grant_id: u64) -> Result<(Address, String, String, i128, u64), Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::LeaseAgreement(grant_id))
-        .ok_or(Error::GrantNotFound)
-}
+// --- Implementation ---
 
-fn write_lease_agreement(env: &Env, grant_id: u64, lessor: &Address, property_id: &str, serial_number: &str, security_deposit: i128, lease_end_time: u64) {
-    let agreement = (lessor.clone(), String::from_str(env, property_id), String::from_str(env, serial_number), security_deposit, lease_end_time);
-    env.storage().instance().set(&DataKey::LeaseAgreement(grant_id), &agreement);
-}
+#[contract]
+pub struct GrantContract;
 
-fn read_property_history(env: &Env, property_id: &str) -> Vec<(u64, Address, u64)> {
-    env.storage()
-        .instance()
-        .get(&DataKey::PropertyRegistry(String::from_str(env, property_id)))
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-fn write_property_history(env: &Env, property_id: &str, history: &Vec<(u64, Address, u64)>) {
-    env.storage().instance().set(&DataKey::PropertyRegistry(String::from_str(env, property_id)), history);
-}
-
-fn calculate_security_deposit(total_amount: i128, deposit_percentage: i128) -> Result<i128, Error> {
-    if deposit_percentage < MIN_SECURITY_DEPOSIT_PERCENTAGE || deposit_percentage > MAX_SECURITY_DEPOSIT_PERCENTAGE {
-        return Err(Error::InvalidSecurityDeposit);
+#[contractimpl]
+impl GrantContract {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        grant_token: Address,
+        treasury: Address,
+        oracle: Address,
+        native_token: Address,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        Ok(())
     }
-    
-    let deposit = total_amount
-        .checked_mul(deposit_percentage)
-        .ok_or(Error::MathOverflow)?
-        .checked_div(10000) // Convert from basis points
-        .ok_or(Error::MathOverflow)?;
-    
-    Ok(deposit)
-}
 
-// Financial Snapshot Helper Functions
-fn read_snapshot_nonce(env: &Env, grant_id: u64) -> u64 {
-    env.storage()
-        .instance()
-        .get(&DataKey::SnapshotNonce(grant_id))
-        .unwrap_or(0)
-}
+    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
 
-fn write_snapshot_nonce(env: &Env, grant_id: u64, nonce: u64) {
-    env.storage().instance().set(&DataKey::SnapshotNonce(grant_id), &nonce);
-}
+        // Check 24-hour limit
+        let now = env.ledger().timestamp();
+        if now >= grant.last_withdrawal_timestamp + 86400 {
+            grant.withdrawal_amount_today = 0;
+            grant.last_withdrawal_timestamp = now;
+        }
 
-fn read_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::FinancialSnapshot(grant_id, timestamp))
-        .ok_or(Error::SnapshotNotFound)
-}
+        if grant.withdrawal_amount_today + amount > grant.max_withdrawal_per_day {
+            return Err(Error::WithdrawalLimitExceeded);
+        }
 
-fn write_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64, snapshot: &FinancialSnapshot) {
-    env.storage().instance().set(&DataKey::FinancialSnapshot(grant_id, timestamp), snapshot);
-}
+        // Logic for transfer...
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
+        grant.withdrawal_amount_today += amount;
 
-fn generate_snapshot_hash(
-    grant_id: u64,
-    total_received: i128,
-    timestamp: u64,
-    expiry: u64,
-    version: u32,
-) -> [u8; 32] {
-    // Create a deterministic hash from snapshot data
-    // In a real implementation, this would use SHA-256 or similar
-    let mut hasher = [0u8; 32];
-    
-    // Simple hash implementation for demonstration
-    // In production, use proper cryptographic hash
-    let combined = format!(
-        "{}:{}:{}:{}:{}",
-        grant_id, total_received, timestamp, expiry, version
-    );
-    
-    // For now, return a placeholder hash
-    // TODO: Implement proper SHA-256 hashing
-    for i in 0..32.min(combined.len()) {
-        hasher[i] = combined.as_bytes()[i];
+        let token_client = token::Client::new(&env, &grant.token_address);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
-    
-    hasher
 }
 
-fn generate_contract_signature(
-    env: &Env,
-    grant_id: u64,
-    total_received: i128,
-    timestamp: u64,
-) -> [u8; 64] {
-    // Generate a contract signature for the snapshot
-    // In a real implementation, this would use the contract's private key
-    // For now, return a deterministic signature based on the data
-    let mut signature = [0u8; 64];
-    
-    let combined = format!("{}:{}:{}", grant_id, total_received, timestamp);
-    
-    // Simple signature generation for demonstration
-    // In production, use proper cryptographic signing
-    for i in 0..64.min(combined.len()) {
-        signature[i] = combined.as_bytes()[i];
-    }
-    
-    signature
-}
-
-// Slashing Proposal Helper Functions
-fn read_next_proposal_id(env: &Env) -> u64 {
-    env.storage()
-        .instance()
-        .get(&DataKey::NextProposalId)
-        .unwrap_or(1)
-}
+// --- Helpers ---
 
 fn write_next_proposal_id(env: &Env, proposal_id: u64) {
     env.storage().instance().set(&DataKey::NextProposalId, &proposal_id);
@@ -4629,13 +4117,8 @@ pub mod grant {
     }
 }
 
-fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
-    let args = (grant_id, amount).into_val(env);
-    let _ = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
-        recipient,
-        &Symbol::new(env, "on_withdraw"),
-        args,
-    );
+fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
 }
 
 // ===== CROSS-PROJECT REPUTATION SCORING FUNCTIONS =====
