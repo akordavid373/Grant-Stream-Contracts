@@ -52,7 +52,6 @@ const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason lengt
 const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 
 
-
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -396,6 +395,45 @@ pub struct AmendmentAppeal {
     pub votes_against: i128,
     pub total_eligible_power: i128,
     pub executed_at: Option<u64>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct JurisdictionInfo {
+    pub code: String,           // Jurisdiction code (e.g., "US-CA", "GB-LDN")
+    pub name: String,           // Human-readable name
+    pub tax_withholding_rate: u32, // Tax rate in basis points (1/100 of percent)
+    pub tax_treaty_eligible: bool, // Whether tax treaty benefits apply
+    pub documentation_required: bool, // Whether additional documentation is required
+    pub updated_at: u64,        // Last update timestamp
+    pub updated_by: Address,    // Who updated this jurisdiction
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeRecord {
+    pub address: Address,           // Grantee's wallet address
+    pub jurisdiction_code: String,   // Tax jurisdiction code
+    pub tax_id: Option<String>,      // Tax identifier (SSN, EIN, etc.)
+    pub tax_treaty_claimed: bool,    // Whether tax treaty benefits are claimed
+    pub verified: bool,              // Whether jurisdiction information is verified
+    pub verification_documents: Option<[u8; 32]>, // Hash of verification documents
+    pub created_at: u64,             // Record creation timestamp
+    pub updated_at: u64,             // Last update timestamp
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct TaxWithholdingRecord {
+    pub grant_id: u64,               // Associated grant ID
+    pub grantee: Address,            // Grantee address
+    pub gross_amount: i128,          // Gross payment amount
+    pub tax_rate: u32,               // Tax withholding rate (basis points)
+    pub tax_withheld: i128,          // Amount withheld for taxes
+    pub net_amount: i128,            // Net amount paid to grantee
+    pub jurisdiction_code: String,   // Jurisdiction used for calculation
+    pub payment_date: u64,           // Payment timestamp
+    pub tax_report_id: Option<u64>,  // Reference to tax report
 }
 
 #[derive(Clone)]
@@ -822,14 +860,6 @@ pub enum DataKey {
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
 
-    // Task #192: Batch refund tracking
-    DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
-    GrantDonors(u64),          // List of donors for a grant
-    
-    // Task #184: Stream NFT Wrapping for Secondary Liquidity
-    StreamNFTContract, // Address of the Stream NFT contract
-    WrappedStreamNFT(u64), // Maps grant_id to NFT token_id
-    StreamNFTBeneficiary(u64), // Maps grant_id to current NFT holder
 }
 
 #[contracterror]
@@ -876,47 +906,7 @@ pub enum Error {
     NoStakeToSlash = 34,
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
-    // Gas buffer errors
-    InsufficientGasBuffer = 65,
-    GasBufferNotEnabled = 66,
-    // Self-destruct errors
-    SelfDestructConditionsNotMet = 67,
-    GrantsNotCompleted = 68,
-    BalancesNotZero = 69,
-    // Joint grant errors
-    NotJointGrantRecipient = 70,
-    DualSignatureRequired = 71,
-    AlreadySigned = 72,
-    InvalidSharePercentage = 73,
-    CannotSplitActiveGrant = 74,
-    
-    // Task 1: Withdraw All errors
-    ClawbackWindowActive = 65,
-    WithdrawalBuffered = 66,
-    InvalidWithdrawalAmount = 67,
-    
-    // Task 2: Financial Statement errors
-    StatementNotFound = 68,
-    InvalidStatementData = 69,
-    
-    // Task 3: Clawback errors  
-    ClawbackExpired = 70,
-    ClawbackNotAuthorized = 71,
-    FundsAlreadyReleased = 72,
-    
-    // Task 4: Cross-Asset Matching errors
-    PriceOracleNotFound = 73,
-    InsufficientMatchingPool = 74,
-    PriceVolatilityExceeded = 75,
-    InvalidPriceBuffer = 76,
-    
-    // Task #184: Stream NFT Wrapping errors
-    StreamNFTNotFound = 77,
-    StreamAlreadyWrapped = 78,
-    StreamNotWrapped = 79,
-    InvalidDiscountRate = 80,
-    NFTTransferFailed = 81,
-    StreamExpired = 82,
+
 }
 
 // --- Internal Helpers ---
@@ -4123,6 +4113,12 @@ pub mod grant {
     }
 
 
+        );
+
+        Ok(())
+    }
+
+
     }
 }
 
@@ -4280,88 +4276,30 @@ fn get_next_appeal_id(env: &Env) -> u64 {
     env.ledger().sequence
 }
 
-/// Calculate reputation-based fee reduction for staking
-/// Returns the reduced stake amount based on reputation score
-pub fn calculate_reputation_stake_discount(env: &Env, user: &Address, base_amount: i128) -> Result<i128, Error> {
-    let reputation = match read_reputation_score(env, user) {
-        Some(score) => {
-            // If score is older than 24 hours, recalculate
-            let now = env.ledger().timestamp();
-            if now - score.last_updated > 86400 {
-                calculate_reputation_score(env, user)?
-            } else {
-                score
-            }
-        }
-        None => calculate_reputation_score(env, user)?,
-    };
+// --- Tax Jurisdiction Helper Functions ---
 
-    // Calculate discount based on reputation
-    // Higher completion count and average score = higher discount
-    let completion_discount = (reputation.total_completions as i128 * 500_000); // 0.05 XLM per completion
-    let score_discount = (reputation.average_score as i128 * 1_000_000) / 100; // Up to 1 XLM for 100% average
-
-    let total_discount = completion_discount + score_discount;
-    let max_discount = base_amount / 2; // Max 50% discount
-
-    let actual_discount = if total_discount > max_discount {
-        max_discount
-    } else {
-        total_discount
-    };
-
-    Ok(base_amount - actual_discount)
+fn read_jurisdiction(env: &Env, code: &str) -> Result<JurisdictionInfo, Error> {
+    env.storage().instance()
+        .get(&DataKey::JurisdictionRegistry(String::from_str_slice(env, code)))
+        .ok_or(Error::JurisdictionNotFound)
 }
 
-/// Get reputation score for a user (public function)
-pub fn get_reputation_score(env: Env, user: Address) -> Result<ReputationScore, Error> {
-    match read_reputation_score(&env, &user) {
-        Some(score) => {
-            // Check if score needs refresh
-            let now = env.ledger().timestamp();
-            if now - score.last_updated > 86400 {
-                calculate_reputation_score(&env, &user)
-            } else {
-                Ok(score)
-            }
-        }
-        None => calculate_reputation_score(&env, &user),
-    }
+fn read_jurisdiction_codes(env: &Env) -> Vec<String> {
+    env.storage().instance()
+        .get(&DataKey::JurisdictionCodes)
+        .unwrap_or_else(|| Vec::new(env))
 }
 
-// ===== REPUTATION STORAGE FUNCTIONS =====
-
-fn read_reputation_score(env: &Env, user: &Address) -> Option<ReputationScore> {
-    env.storage().instance().get(&DataKey::ReputationScore(user.clone()))
+fn read_grantee_record(env: &Env, grantee_address: &Address) -> Result<GranteeRecord, Error> {
+    env.storage().instance()
+        .get(&DataKey::GranteeJurisdiction(grantee_address))
+        .ok_or(Error::JurisdictionNotFound)
 }
 
-fn write_reputation_score(env: &Env, user: &Address, score: &ReputationScore) {
-    env.storage().instance().set(&DataKey::ReputationScore(user.clone()), score);
-}
-
-fn read_external_contracts(env: &Env) -> Vec<ExternalContractQuery> {
-    env.storage().instance().get(&DataKey::ExternalContracts)
-        .unwrap_or(Vec::new(env))
-}
-
-fn write_external_contracts(env: &Env, contracts: Vec<ExternalContractQuery>) {
-    env.storage().instance().set(&DataKey::ExternalContracts, &contracts);
-}
-
-fn read_reputation_cache(env: &Env, user: &Address, contract: &Address) -> Option<bool> {
-    env.storage().instance().get(&DataKey::ReputationCache(user.clone(), contract.clone()))
-}
-
-fn write_reputation_cache(env: &Env, user: &Address, contract: &Address, completed: bool) {
-    env.storage().instance().set(&DataKey::ReputationCache(user.clone(), contract.clone()), &completed);
-}
-
-fn read_reputation_cache_expiry(env: &Env, user: &Address, contract: &Address) -> Option<u64> {
-    env.storage().instance().get(&DataKey::ReputationCacheExpiry(user.clone(), contract.clone()))
-}
-
-fn write_reputation_cache_expiry(env: &Env, user: &Address, contract: &Address, expiry: u64) {
-    env.storage().instance().set(&DataKey::ReputationCacheExpiry(user.clone(), contract.clone()), &expiry);
+fn read_tax_withholding_reserve(env: &Env) -> Result<Address, Error> {
+    env.storage().instance()
+        .get(&DataKey::TaxWithholdingReserve)
+        .ok_or(Error::JurisdictionRegistryNotSet)
 }
 
 #[cfg(test)]
@@ -4386,4 +4324,4 @@ mod test_yield;
 #[cfg(test)]
 mod test_fee;
 #[cfg(test)]
-mod test_cross_chain_features;
+
