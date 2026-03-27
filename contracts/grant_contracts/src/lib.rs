@@ -54,6 +54,16 @@ const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason
 const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason length
 const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 
+// Tax Jurisdiction constants
+const MAX_JURISDICTION_CODE_LENGTH: u32 = 10; // Maximum jurisdiction code length
+const DEFAULT_TAX_WITHHOLDING_RATE: u32 = 0;   // 0% default withholding rate
+const MAX_TAX_WITHHOLDING_RATE: u32 = 5000;    // 50% maximum withholding rate
+
+// Grant Amendment Challenge Period constants
+const AMENDMENT_CHALLENGE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days challenge window
+const MAX_AMENDMENT_REASON_LENGTH: u32 = 1000; // Maximum amendment reason length
+const MAX_CHALLENGE_REASON_LENGTH_AMENDMENT: u32 = 1000; // Maximum challenge reason length for amendments
+
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -473,6 +483,15 @@ pub struct AmendmentAppeal {
     pub votes_against: i128,
     pub total_eligible_power: i128,
     pub executed_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum AppealStatus {
+    Active,             // Appeal is active, voting period open
+    Approved,           // Appeal approved, amendment rejected
+    Rejected,           // Appeal rejected, amendment stands
+    Expired,            // Voting period expired without decision
 }
 
 #[derive(Clone)]
@@ -895,6 +914,21 @@ enum DataKey {
     BurnedStakes, // Track total burned stakes for transparency
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
+    // Tax Jurisdiction keys
+    JurisdictionRegistry(String), // Maps jurisdiction code to tax rate
+    JurisdictionCodes,           // List of all jurisdiction codes
+    GranteeJurisdiction(Address), // Maps grantee address to jurisdiction code
+    TaxWithholdingReserve,       // Reserve for tax withholding funds
+    JurisdictionRegistryContract, // Address of jurisdiction registry contract
+    TaxWithholdingRecord(u64, u64), // Maps grant_id + payment_id to tax record
+    NextTaxRecordId,             // Next available tax record ID
+    // Grant Amendment Challenge Period keys
+    GrantAmendment(u64),         // Maps amendment_id to amendment details
+    GrantAmendments(u64),        // Maps grant_id to list of amendment IDs
+    NextAmendmentId,             // Next available amendment ID
+    AmendmentIds,                // List of all amendment IDs
+    AmendmentAppeal(u64),         // Maps appeal_id to appeal details
+    NextAppealId,                // Next available appeal ID
 
 }
 
@@ -977,6 +1011,28 @@ pub enum Error {
     // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
+    // Tax Jurisdiction errors
+    JurisdictionNotFound = 74,
+    JurisdictionAlreadyExists = 75,
+    InvalidJurisdictionCode = 76,
+    InvalidTaxRate = 77,
+    JurisdictionRegistryNotSet = 78,
+    TaxWithholdingFailed = 79,
+    GranteeJurisdictionNotFound = 80,
+    // Grant Amendment Challenge Period errors
+    AmendmentNotFound = 81,
+    AmendmentAlreadyExists = 82,
+    AmendmentNotProposed = 83,
+    AmendmentChallengePeriodExpired = 84,
+    AmendmentAlreadyChallenged = 85,
+    AmendmentAlreadyExecuted = 86,
+    AmendmentNotChallenged = 87,
+    AppealNotFound = 88,
+    AppealAlreadyExists = 89,
+    AppealVotingPeriodActive = 90,
+    AppealVotingPeriodEnded = 91,
+    InvalidAmendmentReason = 92,
+    InvalidChallengeReason = 93,
 
 }
 
@@ -4125,12 +4181,502 @@ pub mod grant {
         Ok(())
     }
 
+    // --- Tax Jurisdiction Functions (#207) ---
 
+    /// Register a new tax jurisdiction
+    /// Only admin can register new jurisdictions
+    pub fn register_jurisdiction(
+        env: Env,
+        admin: Address,
+        code: String,
+        name: String,
+        tax_withholding_rate: u32,
+        tax_treaty_eligible: bool,
+        documentation_required: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        // Validate jurisdiction code
+        if code.len() > MAX_JURISDICTION_CODE_LENGTH as usize || code.is_empty() {
+            return Err(Error::InvalidJurisdictionCode);
+        }
+
+        // Validate tax rate
+        if tax_withholding_rate > MAX_TAX_WITHHOLDING_RATE {
+            return Err(Error::InvalidTaxRate);
+        }
+
+        // Check if jurisdiction already exists
+        if env.storage().instance().get::<DataKey, JurisdictionInfo>(&DataKey::JurisdictionRegistry(code.clone())).is_some() {
+            return Err(Error::JurisdictionAlreadyExists);
+        }
+
+        let jurisdiction = JurisdictionInfo {
+            code: code.clone(),
+            name: name.clone(),
+            tax_withholding_rate,
+            tax_treaty_eligible,
+            documentation_required,
+            updated_at: env.ledger().timestamp(),
+            updated_by: admin,
+        };
+
+        // Store jurisdiction
+        env.storage().instance().set(&DataKey::JurisdictionRegistry(code.clone()), &jurisdiction);
+
+        // Update jurisdiction codes list
+        let mut codes = read_jurisdiction_codes(&env);
+        codes.push_back(code.clone());
+        env.storage().instance().set(&DataKey::JurisdictionCodes, &codes);
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "jurisdiction_registered"),),
+            (code, name, tax_withholding_rate),
         );
 
         Ok(())
     }
 
+    /// Update an existing tax jurisdiction
+    /// Only admin can update jurisdictions
+    pub fn update_jurisdiction(
+        env: Env,
+        admin: Address,
+        code: String,
+        name: String,
+        tax_withholding_rate: u32,
+        tax_treaty_eligible: bool,
+        documentation_required: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        // Validate tax rate
+        if tax_withholding_rate > MAX_TAX_WITHHOLDING_RATE {
+            return Err(Error::InvalidTaxRate);
+        }
+
+        // Check if jurisdiction exists
+        let _existing = read_jurisdiction(&env, &code)?;
+
+        let jurisdiction = JurisdictionInfo {
+            code: code.clone(),
+            name: name.clone(),
+            tax_withholding_rate,
+            tax_treaty_eligible,
+            documentation_required,
+            updated_at: env.ledger().timestamp(),
+            updated_by: admin,
+        };
+
+        // Update jurisdiction
+        env.storage().instance().set(&DataKey::JurisdictionRegistry(code.clone()), &jurisdiction);
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "jurisdiction_updated"),),
+            (code, name, tax_withholding_rate),
+        );
+
+        Ok(())
+    }
+
+    /// Register grantee's tax jurisdiction information
+    /// Only admin can register grantee jurisdictions
+    pub fn register_grantee_jurisdiction(
+        env: Env,
+        admin: Address,
+        grantee_address: Address,
+        jurisdiction_code: String,
+        tax_id: Option<String>,
+        tax_treaty_claimed: bool,
+        verification_documents: Option<[u8; 32]>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        // Validate jurisdiction exists
+        let _jurisdiction = read_jurisdiction(&env, &jurisdiction_code)?;
+
+        let record = GranteeRecord {
+            address: grantee_address.clone(),
+            jurisdiction_code: jurisdiction_code.clone(),
+            tax_id,
+            tax_treaty_claimed,
+            verified: true, // Admin registration implies verification
+            verification_documents,
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+        };
+
+        // Store grantee record
+        env.storage().instance().set(&DataKey::GranteeJurisdiction(grantee_address.clone()), &record);
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "grantee_jurisdiction_registered"),),
+            (grantee_address, jurisdiction_code),
+        );
+
+        Ok(())
+    }
+
+    /// Calculate tax withholding for a payment
+    /// Returns (tax_withheld, net_amount, effective_tax_rate)
+    pub fn calculate_tax_withholding(
+        env: Env,
+        grantee_address: Address,
+        gross_amount: i128,
+    ) -> Result<(i128, i128, u32), Error> {
+        // Get grantee record
+        let record = read_grantee_record(&env, &grantee_address)?;
+        
+        // Get jurisdiction info
+        let jurisdiction = read_jurisdiction(&env, &record.jurisdiction_code)?;
+        
+        // Calculate effective tax rate
+        let mut effective_rate = jurisdiction.tax_withholding_rate;
+        
+        // Apply tax treaty benefits if claimed and eligible
+        if record.tax_treaty_claimed && jurisdiction.tax_treaty_eligible {
+            effective_rate = effective_rate / 2; // 50% reduction
+        }
+        
+        // Calculate tax withheld
+        let tax_withheld = (gross_amount * effective_rate as i128) / 10000;
+        let net_amount = gross_amount - tax_withheld;
+        
+        Ok((tax_withheld, net_amount, effective_rate))
+    }
+
+    /// Process payment with automatic tax withholding
+    /// Returns tax record ID
+    pub fn process_payment_with_tax(
+        env: Env,
+        grant_id: u64,
+        grantee_address: Address,
+        gross_amount: i128,
+        token_address: Address,
+    ) -> Result<u64, Error> {
+        // Calculate tax withholding
+        let (tax_withheld, net_amount, tax_rate) = Self::calculate_tax_withholding(
+            env.clone(),
+            grantee_address.clone(),
+            gross_amount,
+        )?;
+
+        // Get tax withholding reserve address
+        let tax_reserve = read_tax_withholding_reserve(&env)?;
+
+        // Get next tax record ID
+        let tax_record_id = get_next_tax_record_id(&env);
+
+        // Get grantee record for jurisdiction code
+        let record = read_grantee_record(&env, &grantee_address)?;
+
+        // Create tax withholding record
+        let tax_record = TaxWithholdingRecord {
+            grant_id,
+            grantee: grantee_address.clone(),
+            gross_amount,
+            tax_rate,
+            tax_withheld,
+            net_amount,
+            jurisdiction_code: record.jurisdiction_code.clone(),
+            payment_date: env.ledger().timestamp(),
+            tax_report_id: None,
+        };
+
+        // Store tax record
+        env.storage().instance().set(&DataKey::TaxWithholdingRecord(grant_id, tax_record_id), &tax_record);
+
+        // Transfer net amount to grantee
+        if net_amount > 0 {
+            let token_client = token::Client::new(&env, &token_address);
+            token_client.transfer(&env.current_contract_address(), &grantee_address, &net_amount);
+        }
+
+        // Transfer tax amount to reserve
+        if tax_withheld > 0 {
+            let token_client = token::Client::new(&env, &token_address);
+            token_client.transfer(&env.current_contract_address(), &tax_reserve, &tax_withheld);
+        }
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "payment_with_tax_processed"),),
+            (grant_id, grantee_address, gross_amount, tax_withheld, net_amount),
+        );
+
+        Ok(tax_record_id)
+    }
+
+    /// Get jurisdiction information by code
+    pub fn get_jurisdiction(env: Env, code: String) -> Result<JurisdictionInfo, Error> {
+        read_jurisdiction(&env, &code)
+    }
+
+    /// Get all registered jurisdictions
+    pub fn get_all_jurisdictions(env: Env) -> Vec<JurisdictionInfo> {
+        let codes = read_jurisdiction_codes(&env);
+        let mut jurisdictions = Vec::new(&env);
+        
+        for code in codes.iter() {
+            if let Ok(jurisdiction) = read_jurisdiction(&env, &code) {
+                jurisdictions.push_back(jurisdiction);
+            }
+        }
+        
+        jurisdictions
+    }
+
+    /// Get grantee's tax information
+    pub fn get_grantee_record(env: Env, grantee_address: Address) -> Result<GranteeRecord, Error> {
+        read_grantee_record(&env, &grantee_address)
+    }
+
+    /// Set tax withholding reserve address
+    /// Only admin can set the reserve
+    pub fn set_tax_withholding_reserve(env: Env, admin: Address, reserve_address: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        env.storage().instance().set(&DataKey::TaxWithholdingReserve, &reserve_address);
+        
+        env.events().publish(
+            (Symbol::new(&env, "tax_reserve_set"),),
+            reserve_address,
+        );
+        
+        Ok(())
+    }
+
+    // --- Grant Amendment Challenge Period Functions (#206) ---
+
+    /// Propose an amendment to a grant
+    /// Starts the 7-day challenge window
+    pub fn propose_amendment(
+        env: Env,
+        proposer: Address,
+        grant_id: u64,
+        amendment_type: AmendmentType,
+        old_value: String,
+        new_value: String,
+        reason: String,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+
+        // Validate reason length
+        if reason.len() > MAX_AMENDMENT_REASON_LENGTH as usize {
+            return Err(Error::InvalidAmendmentReason);
+        }
+
+        // Check if grant exists
+        let _grant = read_grant(&env, grant_id)?;
+
+        // Check if there's already an active amendment for this grant
+        if let Ok(_active) = read_active_amendment(&env, grant_id) {
+            return Err(Error::AmendmentAlreadyExists);
+        }
+
+        // Get next amendment ID
+        let amendment_id = get_next_amendment_id(&env);
+
+        let now = env.ledger().timestamp();
+        let challenge_deadline = now + AMENDMENT_CHALLENGE_WINDOW;
+
+        let amendment = GrantAmendment {
+            amendment_id,
+            grant_id,
+            proposer: proposer.clone(),
+            amendment_type,
+            old_value: old_value.clone(),
+            new_value: new_value.clone(),
+            reason: reason.clone(),
+            proposed_at: now,
+            challenge_deadline,
+            status: AmendmentStatus::Proposed,
+            challenge_reason: None,
+            challenged_at: None,
+            appeal_id: None,
+        };
+
+        // Store amendment
+        env.storage().instance().set(&DataKey::GrantAmendment(grant_id), &amendment);
+
+        // Update grant amendments list
+        let mut amendments = read_grant_amendments(&env, grant_id);
+        amendments.push_back(amendment_id);
+        env.storage().instance().set(&DataKey::GrantAmendments(grant_id), &amendments);
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "amendment_proposed"),),
+            (amendment_id, grant_id, proposer, challenge_deadline),
+        );
+
+        Ok(amendment_id)
+    }
+
+    /// Challenge a proposed amendment
+    /// Only the grantee can challenge an amendment
+    pub fn challenge_amendment(
+        env: Env,
+        grantee: Address,
+        amendment_id: u64,
+        challenge_reason: String,
+    ) -> Result<(), Error> {
+        grantee.require_auth();
+
+        // Validate challenge reason length
+        if challenge_reason.len() > MAX_CHALLENGE_REASON_LENGTH_AMENDMENT as usize {
+            return Err(Error::InvalidChallengeReason);
+        }
+
+        // Get amendment
+        let mut amendment = read_amendment(&env, amendment_id)?;
+
+        // Check if amendment can be challenged
+        if amendment.status != AmendmentStatus::Proposed {
+            return Err(Error::AmendmentNotProposed);
+        }
+
+        // Check if challenge window is still open
+        if env.ledger().timestamp() > amendment.challenge_deadline {
+            return Err(Error::AmendmentChallengePeriodExpired);
+        }
+
+        // Check if already challenged
+        if amendment.challenge_reason.is_some() {
+            return Err(Error::AmendmentAlreadyChallenged);
+        }
+
+        // Verify challenger is the grantee
+        let grant = read_grant(&env, amendment.grant_id)?;
+        if grant.recipient != grantee {
+            return Err(Error::NotAuthorized);
+        }
+
+        // Update amendment
+        amendment.status = AmendmentStatus::Challenged;
+        amendment.challenge_reason = Some(challenge_reason.clone());
+        amendment.challenged_at = Some(env.ledger().timestamp());
+
+        // Store updated amendment
+        env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &amendment);
+
+        // Create appeal
+        create_amendment_appeal(&env, &amendment, &challenge_reason)?;
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "amendment_challenged"),),
+            (amendment_id, grantee, challenge_reason),
+        );
+
+        Ok(())
+    }
+
+    /// Execute an amendment after challenge period expires
+    /// Anyone can call this after the challenge period
+    pub fn execute_amendment(env: Env, amendment_id: u64) -> Result<(), Error> {
+        let mut amendment = read_amendment(&env, amendment_id)?;
+
+        // Check if amendment can be executed
+        if amendment.status != AmendmentStatus::Proposed {
+            return Err(Error::AmendmentNotProposed);
+        }
+
+        // Check if challenge window has expired
+        if env.ledger().timestamp() <= amendment.challenge_deadline {
+            return Err(Error::AmendmentChallengePeriodExpired);
+        }
+
+        // Execute the amendment
+        execute_amendment_change(&env, &amendment)?;
+
+        // Update amendment status
+        amendment.status = AmendmentStatus::Executed;
+        env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &amendment);
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "amendment_executed"),),
+            (amendment_id, amendment.grant_id),
+        );
+
+        Ok(())
+    }
+
+    /// Rage quit - grantee can withdraw and terminate grant if amendment is proposed
+    /// This is the "Tenant-at-Will" protection
+    pub fn rage_quit_grant(env: Env, grantee: Address, grant_id: u64) -> Result<(), Error> {
+        grantee.require_auth();
+
+        // Check if there's an active amendment for this grant
+        let amendment = read_active_amendment(&env, grant_id)?;
+
+        // Get grant
+        let mut grant = read_grant(&env, grant_id)?;
+
+        // Verify caller is the grantee
+        if grant.recipient != grantee {
+            return Err(Error::NotAuthorized);
+        }
+
+        // Settle any accrued amounts
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
+
+        // Calculate vested amount (total withdrawn + claimable)
+        let vested_amount = grant.withdrawn + grant.claimable;
+
+        // Transfer vested amount to grantee
+        if vested_amount > 0 {
+            let token_client = token::Client::new(&env, &grant.token_address);
+            token_client.transfer(&env.current_contract_address(), &grantee, &vested_amount);
+            
+            // Update grant amounts
+            grant.withdrawn = vested_amount;
+            grant.claimable = 0;
+        }
+
+        // Mark grant as rage quit
+        grant.status = GrantStatus::RageQuitted;
+
+        // Store updated grant
+        env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
+
+        // Publish event
+        env.events().publish(
+            (Symbol::new(&env, "grant_rage_quit"),),
+            (grant_id, grantee, vested_amount),
+        );
+
+        Ok(())
+    }
+
+    /// Get amendment details
+    pub fn get_amendment(env: Env, amendment_id: u64) -> Result<GrantAmendment, Error> {
+        read_amendment(&env, amendment_id)
+    }
+
+    /// Get all amendments for a grant
+    pub fn get_grant_amendments(env: Env, grant_id: u64) -> Vec<GrantAmendment> {
+        let amendment_ids = read_grant_amendments(&env, grant_id);
+        let mut amendments = Vec::new(&env);
+        
+        for amendment_id in amendment_ids.iter() {
+            if let Ok(amendment) = read_amendment(&env, amendment_id) {
+                amendments.push_back(amendment);
+            }
+        }
+        
+        amendments
+    }
+
+    /// Get appeal details
+    pub fn get_appeal(env: Env, appeal_id: u64) -> Result<AmendmentAppeal, Error> {
+        env.storage().instance()
+            .get(&DataKey::AmendmentAppeal(appeal_id))
+            .ok_or(Error::AppealNotFound)
+    }
 
     }
 }
@@ -4172,6 +4718,92 @@ fn read_amendment_ids(env: &Env) -> Vec<u64> {
     env.storage().instance()
         .get(&DataKey::AmendmentIds)
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_grant_amendments(env: &Env, grant_id: u64) -> Vec<u64> {
+    env.storage().instance()
+        .get(&DataKey::GrantAmendments(grant_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn get_next_amendment_id(env: &Env) -> u64 {
+    env.ledger().sequence()
+}
+
+fn get_next_tax_record_id(env: &Env) -> u64 {
+    env.ledger().sequence()
+}
+
+fn execute_amendment_change(env: &Env, amendment: &GrantAmendment) -> Result<(), Error> {
+    let mut grant = read_grant(env, amendment.grant_id)?;
+    
+    match amendment.amendment_type {
+        AmendmentType::FlowRateChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_flow_rate = value_str.parse::<i128>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.flow_rate = new_flow_rate;
+        },
+        AmendmentType::AmountChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_amount = value_str.parse::<i128>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.total_amount = new_amount;
+        },
+        AmendmentType::DurationChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_duration = value_str.parse::<u64>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.stream_duration = new_duration;
+        },
+        AmendmentType::RecipientChange => {
+            // This would require address parsing
+            // For now, we'll skip this implementation
+            return Err(Error::NotAuthorized);
+        },
+        AmendmentType::TokenChange => {
+            // This would require address parsing
+            // For now, we'll skip this implementation
+            return Err(Error::NotAuthorized);
+        },
+        AmendmentType::Termination => {
+            grant.status = GrantStatus::Cancelled;
+        },
+    }
+    
+    env.storage().instance().set(&DataKey::Grant(amendment.grant_id), &grant);
+    Ok(())
+}
+
+fn create_amendment_appeal(env: &Env, amendment: &GrantAmendment, reason: &str) -> Result<(), Error> {
+    let appeal_id = get_next_appeal_id(env);
+    let appeal = AmendmentAppeal {
+        appeal_id,
+        amendment_id: amendment.amendment_id,
+        appellant: amendment.proposer, // In case of challenge, the original proposer becomes appellant
+        reason: String::from_str_slice(env, reason),
+        evidence_hash: [0u8; 32], // Default hash for now
+        created_at: env.ledger().timestamp(),
+        voting_deadline: env.ledger().timestamp() + AMENDMENT_CHALLENGE_WINDOW,
+        status: AppealStatus::Active,
+        votes_for: 0,
+        votes_against: 0,
+        total_eligible_power: 0,
+        executed_at: None,
+    };
+    
+    env.storage().instance().set(&DataKey::AmendmentAppeal(appeal_id), &appeal);
+    
+    // Update amendment with appeal reference
+    let mut updated_amendment = amendment.clone();
+    updated_amendment.appeal_id = Some(appeal_id);
+    env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &updated_amendment);
+    
+    Ok(())
+}
+
+fn get_next_appeal_id(env: &Env) -> u64 {
+    env.ledger().sequence()
 }
 
 fn get_next_amendment_id(env: &Env) -> u64 {
