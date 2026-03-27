@@ -70,8 +70,9 @@ const DEX_PRICE_EXPIRY_SECS: u64 = 300; // 5 minutes DEX price expiry
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
-pub mod atomic_bridge;
-pub mod governance;
+pub mod temporal_guard;
+pub mod stream_nft;
+pub mod multi_token_matching;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
