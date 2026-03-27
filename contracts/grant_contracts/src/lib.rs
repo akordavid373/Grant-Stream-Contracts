@@ -4557,3 +4557,5 @@ mod test_yield;
 mod test_fee;
 #[cfg(test)]
 mod test_proposal_staking;
+#[cfg(test)]
+mod test_tax_jurisdiction;
