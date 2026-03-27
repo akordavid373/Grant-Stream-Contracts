@@ -519,4 +519,63 @@ fn test_arbitration_escrow() {
     assert_eq!(escrow.status, ArbitrationStatus::Resolved);
 }
 
+#[test]
+fn test_balance_optimization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
+    let admin = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.initialize(&admin, &token_address, &admin, &admin, &token_address);
+
+    // Create a grant
+    let grant_id = 1;
+    client.create_grant(&grant_id, &grantee, &1000, &10, &0, &1, &1, &0);
+
+    // Let some time pass for streaming
+    set_timestamp(&env, 50);
+
+    // First balance query - should compute and cache
+    let snapshot1 = client.get_balance_optimized(&grant_id).unwrap();
+    assert_eq!(snapshot1.grant_id, grant_id);
+    assert_eq!(snapshot1.total_amount, 1000);
+    assert!(snapshot1.claimable > 0);
+
+    // Second balance query within 30 seconds - should use cache
+    let snapshot2 = client.get_balance_optimized(&grant_id).unwrap();
+    assert_eq!(snapshot1.claimable, snapshot2.claimable); // Should be identical (cached)
+
+    // Withdraw some funds - should invalidate cache
+    client.withdraw(&grant_id, &grantee);
+
+    // Next balance query - should recompute
+    let snapshot3 = client.get_balance_optimized(&grant_id).unwrap();
+    assert!(snapshot3.withdrawn > snapshot2.withdrawn); // Withdrawn amount should increase
+
+    // Test bulk balance query
+    let grant_ids = vec![&env, grant_id];
+    let bulk_snapshots = client.get_bulk_balances_optimized(&grant_ids);
+    assert_eq!(bulk_snapshots.len(), 1);
+    assert_eq!(bulk_snapshots.get(0).unwrap().grant_id, grant_id);
+
+    // Test optimized withdrawable amount
+    let withdrawable = client.get_withdrawable_optimized(&grant_id, &grantee).unwrap();
+    assert!(withdrawable >= 0);
+
+    // Clear cache (admin only)
+    client.clear_balance_cache(&admin, &grant_id);
+
+    // Get cache stats
+    let stats = client.get_cache_stats(&admin).unwrap();
+    assert!(stats.cache_enabled);
+    assert_eq!(stats.cache_ttl_seconds, 30);
+}
+
 }
