@@ -59,6 +59,8 @@ const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 pub mod temporal_guard;
 pub mod stream_nft;
 pub mod multi_token_matching;
+pub mod staking_multiplier;
+pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
@@ -860,6 +862,16 @@ pub enum DataKey {
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
 
+    // Task #192: Batch refund tracking
+    DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
+    GrantDonors(u64),          // List of donors for a grant
+    
+    // Task #189: Conditional Matching Multiplier based on Staking
+    StakingMultiplierContract, // Address of the Staking Multiplier contract
+    VestingVaultContract, // Address of the Vesting Vault contract
+    StakingWeights(Address), // Maps donor to staking weights
+    ProjectTokenSupport(Address), // Maps project token to supported status
+    StakingCache(Address, Address), // Maps donor + project to cached staking info
 }
 
 #[contracterror]
