@@ -55,6 +55,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
     event FundsClaimed(uint256 indexed grantId, address indexed recipient, uint256 netAmount, uint256 sustainabilityTax);
     event GrantToppedUp(uint256 indexed grantId, uint256 amount);
     event GrantClosed(uint256 indexed grantId, uint256 refunded);
+    event GrantRecipientUpdated(uint256 indexed grantId, address indexed oldRecipient, address indexed newRecipient);
     event ZKVerifierSet(address indexed zkVerifier);
     event KYCRequirementChanged(bool required);
 
@@ -174,6 +175,23 @@ contract GrantStream is Ownable, ReentrancyGuard {
         }
 
         emit GrantClosed(grantId, refund);
+    }
+
+    /**
+     * @notice Allows the current recipient to transfer the grant to a new recipient.
+     *         This is useful for moving grants into a Management Vault or Consolidator.
+     * @param grantId ID of the grant to update.
+     * @param newRecipient Address of the new recipient.
+     */
+    function updateRecipient(uint256 grantId, address newRecipient) external nonReentrant {
+        Grant storage grant = grants[grantId];
+        require(grant.active, "GrantStream: inactive grant");
+        require(msg.sender == grant.recipient, "GrantStream: not current recipient");
+        require(newRecipient != address(0), "GrantStream: zero recipient address");
+
+        address oldRecipient = grant.recipient;
+        grant.recipient = newRecipient;
+        emit GrantRecipientUpdated(grantId, oldRecipient, newRecipient);
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────────
