@@ -473,4 +473,30 @@ contract GrantStream is Ownable, ReentrancyGuard {
                grant.endDate > 0 && 
                block.timestamp > grant.endDate;
     }
+
+    // ─── Wasm-Rotation Hook ───────────────────────────────────────────────────
+
+    /**
+     * @notice Called by GrantStreamProxy.upgradeLogic() to confirm that this
+     *         logic version agrees with the proxy's stored immutable terms for
+     *         a given grant.  Must return true; any mismatch aborts the upgrade.
+     * @param grantId     Grant to verify.
+     * @param funder      Expected funder address (from proxy storage).
+     * @param recipient   Expected recipient address (from proxy storage).
+     * @param totalAmount Expected original deposit (from proxy storage).
+     */
+    function verifyImmutableTerms(
+        uint256 grantId,
+        address funder,
+        address recipient,
+        uint256 totalAmount
+    ) external view returns (bool) {
+        Grant storage g = grants[grantId];
+        if (!g.exists) return false;
+        return g.funder    == funder    &&
+               g.recipient == recipient &&
+               // totalAmount is the original deposit; balance may have changed
+               // so we check against the sum of balance + totalVolume (claimed).
+               (g.balance + g.totalVolume) == totalAmount;
+    }
 }
