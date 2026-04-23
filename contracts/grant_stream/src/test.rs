@@ -19,10 +19,14 @@ fn test_create_and_claim() {
     let token_client = token::StellarAssetClient::new(&env, &token_addr);
     token_client.mint(&funder, &2000000000000000);
 
+    // Register mock stablecoin
+    let stable_admin = Address::generate(&env);
+    let stable_addr = env.register_stellar_asset_contract(stable_admin);
+
     let contract_id = env.register_contract(None, GrantStreamContract);
     let client = GrantStreamContractClient::new(&env, &contract_id);
 
-    client.init(&admin, &token_addr, &treasury);
+    client.init(&admin, &token_addr, &treasury, &stable_addr);
     
     let grant_id = client.create_grant(&funder, &recipient, &500000000000000);
     assert_eq!(grant_id, 1);
