@@ -1,244 +1,806 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, BytesN, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    Symbol, vec, IntoVal, String, Map, xdr::ScVal, xdr::ToXdr, Bytes,
+};
 
+// --- Constants ---
+pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+const XLM_DECIMALS: u32 = 7;
+const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
+
+// --- Submodules ---
+pub mod multi_token;
+pub mod yield_treasury;
+pub mod optimized;
+mod self_terminate;
+
+// --- Types ---
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    Token,
-    Treasury,
-    Stablecoin,
-    GrantCounter,
-    Grant(u32),
-    GlobalExchangeRate,
-    TotalPoolBalance,
-    SignerCount,
-    Signer(u32),
-    Threshold,
-    ZKVerificationKey,
-}
-}
+pub enum GrantStatus {
+    Active,
+    Paused,
+    Completed,
+    Cancelled,
+    RageQuitted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamType {
+    FixedAmount,
+    FixedEndDate,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Grant {
-    pub funder: Address,
     pub recipient: Address,
-    pub balance: i128,
-    pub total_volume: i128,
-    pub active: bool,
-    pub start_rate: i128, // Exchange rate snapshot at grant creation
+    pub total_amount: i128,
+    pub withdrawn: i128,
+    pub claimable: i128,
+    pub flow_rate: i128,
+    pub last_update_ts: u64,
+    pub rate_updated_at: u64,
+    pub last_claim_time: u64,
+    pub pending_rate: i128,
+    pub effective_timestamp: u64,
+    pub status: GrantStatus,
+    pub redirect: Option<Address>,
+    pub stream_type: StreamType,
+    pub start_time: u64,
+    pub warmup_duration: u64,
+    /// Optional Stellar Validator reward address. When set, 5% of accruals
+    /// are directed here ("Ecosystem Tax").
+    pub validator: Option<Address>,
+    /// Independent withdrawal counter for the validator's 5% share.
+    pub validator_withdrawn: i128,
+    /// Claimable balance accumulator for the validator (5% of stream).
+    pub validator_claimable: i128,
+    /// CID (Content Identifier) of the legal document (e.g., SAFT or Grant Agreement).
+    pub legal_hash: Option<String>,
+    /// Flag to prevent funds from streaming until the grantee has cryptographically "signed" the legal document on-chain.
+    pub requires_legal_signature: bool,
+    /// Boolean flag indicating if the legal document has been signed by the grantee.
+    pub is_legal_signed: bool,
 }
+
+#[derive(Clone)]
+#[contracttype]
+enum DataKey {
+    Admin,
+    GrantToken,
+    GrantIds,
+    Treasury,
+    Oracle,
+    NativeToken,
+    Grant(u64),
+    RecipientGrants(Address),
+}
+
+#[contracterror]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    NotAuthorized = 3,
+    GrantNotFound = 4,
+    GrantAlreadyExists = 5,
+    InvalidRate = 6,
+    InvalidAmount = 7,
+    InvalidState = 8,
+    MathOverflow = 9,
+    InsufficientReserve = 10,
+    RescueWouldViolateAllocated = 11,
+    GranteeMismatch = 12,
+    GrantNotInactive = 13,
+    NotValidator = 14,
+    LegalSignatureRequired = 15,
+}
+
+// --- Internal Helpers ---
+
+fn read_admin(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
+}
+
+fn read_oracle(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
+}
+
+fn require_admin_auth(env: &Env) -> Result<(), Error> {
+    read_admin(env)?.require_auth();
+    Ok(())
+}
+
+fn require_oracle_auth(env: &Env) -> Result<(), Error> {
+    read_oracle(env)?.require_auth();
+    Ok(())
+}
+
+fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
+    env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
+}
+
+fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+}
+
+fn read_grant_token(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
+}
+
+fn read_treasury(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+}
+
+fn read_grant_ids(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantIds)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
+    let mut total = 0_i128;
+    let ids = read_grant_ids(env);
+    for i in 0..ids.len() {
+        let grant_id = ids.get(i).unwrap();
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+            if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
+                let remaining = grant.total_amount
+                    .checked_sub(grant.withdrawn)
+                    .ok_or(Error::MathOverflow)?;
+                total = total.checked_add(remaining).ok_or(Error::MathOverflow)?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
+    if grant.warmup_duration == 0 {
+        return 10000; // 100% in basis points
+    }
+
+    let warmup_end = grant.start_time + grant.warmup_duration;
+
+    if now >= warmup_end {
+        return 10000; 
+    }
+
+    if now <= grant.start_time {
+        return 2500; // 25% at start
+    }
+
+    let elapsed_warmup = now - grant.start_time;
+    let progress = ((elapsed_warmup as i128) * 10000) / (grant.warmup_duration as i128);
+
+    // 25% + (75% * progress)
+    2500 + (7500 * progress) / 10000
+}
+
+/// Splits `accrued` tokens between the grantee (95%) and the validator (5%).
+/// When no validator is set the full amount goes to the grantee.
+fn apply_accrued_split(grant: &mut Grant, accrued: i128) -> Result<(), Error> {
+    if grant.validator.is_some() && accrued > 0 {
+        let validator_share = accrued
+            .checked_mul(500)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::MathOverflow)?;
+        let grantee_share = accrued
+            .checked_sub(validator_share)
+            .ok_or(Error::MathOverflow)?;
+        grant.claimable = grant.claimable
+            .checked_add(grantee_share)
+            .ok_or(Error::MathOverflow)?;
+        grant.validator_claimable = grant.validator_claimable
+            .checked_add(validator_share)
+            .ok_or(Error::MathOverflow)?;
+    } else {
+        grant.claimable = grant.claimable
+            .checked_add(accrued)
+            .ok_or(Error::MathOverflow)?;
+    }
+    Ok(())
+}
+
+fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
+    if now < grant.last_update_ts { return Err(Error::InvalidState); }
+    
+    let elapsed = now - grant.last_update_ts;
+    if elapsed == 0 {
+        return Ok(());
+    }
+
+    if grant.status == GrantStatus::Active {
+        // Prevent accrual if legal signature is required but not provided
+        if grant.requires_legal_signature && !grant.is_legal_signed {
+            grant.last_update_ts = now;
+            return Ok(());
+        }
+
+        // Handle pending rate increases first
+        if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 && now >= grant.effective_timestamp {
+            let switch_ts = grant.effective_timestamp;
+            // Settle up to switch_ts at old rate
+            let pre_elapsed = switch_ts - grant.last_update_ts;
+            let pre_accrued = calculate_accrued(grant, pre_elapsed, switch_ts)?;
+            apply_accrued_split(grant, pre_accrued)?;
+
+            // Apply new rate
+            grant.flow_rate = grant.pending_rate;
+            grant.rate_updated_at = switch_ts;
+            grant.pending_rate = 0;
+            grant.effective_timestamp = 0;
+            grant.last_update_ts = switch_ts;
+
+            // Recalculate remaining elapsed
+            let post_elapsed = now - switch_ts;
+            let post_accrued = calculate_accrued(grant, post_elapsed, now)?;
+            apply_accrued_split(grant, post_accrued)?;
+        } else {
+            let accrued = calculate_accrued(grant, elapsed, now)?;
+            apply_accrued_split(grant, accrued)?;
+        }
+    }
+
+    let total_accounted = grant.withdrawn
+        .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+    if total_accounted >= grant.total_amount {
+        // Cap remaining claimable so total does not exceed total_amount
+        let already_paid = grant.withdrawn
+            .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+            .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+        grant.claimable = grant.total_amount
+            .checked_sub(already_paid).ok_or(Error::MathOverflow)?
+            .max(0);
+        grant.status = GrantStatus::Completed;
+    }
+
+    grant.last_update_ts = now;
+    Ok(())
+}
+
+fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Error> {
+    let elapsed_i128 = i128::from(elapsed);
+    let base_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
+
+    let multiplier = calculate_warmup_multiplier(grant, now);
+    let accrued = base_accrued
+        .checked_mul(multiplier)
+        .ok_or(Error::MathOverflow)?
+        .checked_div(10000)
+        .ok_or(Error::MathOverflow)?;
+
+    Ok(accrued)
+}
+
+// --- Contract Implementation ---
 
 #[contract]
 pub struct GrantStreamContract;
 
-const SUSTAINABILITY_TAX_BPS: i128 = 100;
-const BPS_DENOMINATOR: i128 = 1_000_000;
-const VOLUME_THRESHOLD: i128 = 100_000 * 10_000_000; // Extrapolating 7 decimals
-
 #[contractimpl]
 impl GrantStreamContract {
-    pub fn init(env: Env, admin: Address, token: Address, treasury: Address, stablecoin: Address) {
-        admin.require_auth();
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        grant_token: Address,
+        treasury: Address,
+        oracle: Address,
+        native_token: Address,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("Already initialized");
+            return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Token, &token);
+        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
-        env.storage().instance().set(&DataKey::Stablecoin, &stablecoin);
-        env.storage().instance().set(&DataKey::GrantCounter, &0u32);
-        env.storage().instance().set(&DataKey::GlobalExchangeRate, &1_000_000i128); // Initial rate: 1.0
-        env.storage().instance().set(&DataKey::TotalPoolBalance, &0i128);
-        env.storage().instance().set(&DataKey::SignerCount, &0u32);
-        env.storage().instance().set(&DataKey::Threshold, &1u32);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        Ok(())
     }
 
-    pub fn create_grant(env: Env, funder: Address, recipient: Address, amount: i128) -> u32 {
-        funder.require_auth();
-        if amount <= 0 { panic!("Amount must be > 0"); }
+    pub fn create_grant(
+        env: Env,
+        grant_id: u64,
+        recipient: Address,
+        total_amount: i128,
+        flow_rate: i128,
+        warmup_duration: u64,
+        validator: Option<Address>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = token::Client::new(&env, &token_addr);
-        
-        token_client.transfer(&funder, &env.current_contract_address(), &amount);
+        if total_amount <= 0 || flow_rate < 0 {
+            return Err(Error::InvalidAmount);
+        }
 
-        let mut counter: u32 = env.storage().instance().get(&DataKey::GrantCounter).unwrap();
-        counter += 1;
-        env.storage().instance().set(&DataKey::GrantCounter, &counter);
+        let key = DataKey::Grant(grant_id);
+        if env.storage().instance().has(&key) {
+            return Err(Error::GrantAlreadyExists);
+        }
 
-        let current_rate: i128 = env.storage().instance().get(&DataKey::GlobalExchangeRate).unwrap();
-        let mut total_balance: i128 = env.storage().instance().get(&DataKey::TotalPoolBalance).unwrap();
-        total_balance += amount;
-        env.storage().instance().set(&DataKey::TotalPoolBalance, &total_balance);
-
+        let now = env.ledger().timestamp();
         let grant = Grant {
-            funder,
-            recipient,
-            balance: amount,
-            total_volume: 0,
-            active: true,
-            start_rate: current_rate,
+            recipient: recipient.clone(),
+            total_amount,
+            withdrawn: 0,
+            claimable: 0,
+            flow_rate,
+            last_update_ts: now,
+            rate_updated_at: now,
+            last_claim_time: now,
+            pending_rate: 0,
+            effective_timestamp: 0,
+            status: GrantStatus::Active,
+            redirect: None,
+            stream_type: StreamType::FixedAmount,
+            start_time: now,
+            warmup_duration,
+            validator: validator,
+            validator_withdrawn: 0,
+            validator_claimable: 0,
+            legal_hash: None,
+            requires_legal_signature: false,
+            is_legal_signed: false,
         };
 
-        env.storage().persistent().set(&DataKey::Grant(counter), &grant);
-        counter
+        env.storage().instance().set(&key, &grant);
+
+        let mut ids = read_grant_ids(&env);
+        ids.push_back(grant_id);
+        env.storage().instance().set(&DataKey::GrantIds, &ids);
+
+        let recipient_key = DataKey::RecipientGrants(recipient);
+        let mut user_grants: Vec<u64> = env.storage().instance().get(&recipient_key).unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
+        Ok(())
     }
 
-    pub fn update_exchange_rate(env: Env, admin: Address, new_rate: i128) {
-        admin.require_auth();
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != current_admin { panic!("Not admin"); }
-        
-        env.storage().instance().set(&DataKey::GlobalExchangeRate, &new_rate);
+    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        if grant.requires_legal_signature && !grant.is_legal_signed {
+            return Err(Error::LegalSignatureRequired);
+        }
+
+        if amount > grant.claimable {
+            return Err(Error::InvalidAmount);
+        }
+
+        grant.claimable = grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
+        grant.withdrawn = grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
+        grant.last_claim_time = env.ledger().timestamp();
+
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        let target = grant.redirect.unwrap_or(grant.recipient.clone());
+        client.transfer(&env.current_contract_address(), &target, &amount);
+
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+
+        Ok(())
     }
 
-    pub fn claim(env: Env, recipient: Address, grant_id: u32, amount: i128) {
-        recipient.require_auth();
-        let mut grant: Grant = env.storage().persistent().get(&DataKey::Grant(grant_id)).unwrap();
+    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
-        if !grant.active { panic!("Grant not active"); }
-        if grant.recipient != recipient { panic!("Not recipient"); }
-        if amount <= 0 || amount > grant.balance { panic!("Invalid amount"); }
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        grant.status = GrantStatus::Paused;
+        write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
 
-        let current_rate: i128 = env.storage().instance().get(&DataKey::GlobalExchangeRate).unwrap();
-        // Calculate yield-adjusted amount
-        let yield_adjusted_amount = (amount * current_rate) / grant.start_rate;
+    pub fn resume_stream(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
 
-        grant.balance -= amount;
-        grant.total_volume += amount;
+        grant.status = GrantStatus::Active;
+        grant.last_update_ts = env.ledger().timestamp();
+        write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
 
-        // compute tax
-        let taxable_amount = if grant.total_volume > VOLUME_THRESHOLD {
-            let total_before = grant.total_volume - amount;
-            if total_before >= VOLUME_THRESHOLD {
-                yield_adjusted_amount
-            } else {
-                (grant.total_volume - VOLUME_THRESHOLD) * current_rate / grant.start_rate
+    pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
+        if new_rate < 0 { return Err(Error::InvalidRate); }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        
+        let old_rate = grant.flow_rate;
+        if new_rate > old_rate {
+            grant.pending_rate = new_rate;
+            grant.effective_timestamp = env.ledger().timestamp() + RATE_INCREASE_TIMELOCK_SECS;
+        } else {
+            grant.flow_rate = new_rate;
+            grant.rate_updated_at = env.ledger().timestamp();
+            grant.pending_rate = 0;
+            grant.effective_timestamp = 0;
+        }
+
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("rateupdt"), grant_id), (old_rate, new_rate));
+        Ok(())
+    }
+
+    pub fn apply_kpi_multiplier(env: Env, grant_id: u64, multiplier: i128) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+        if multiplier <= 0 { return Err(Error::InvalidRate); }
+
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        
+        let old_rate = grant.flow_rate;
+        grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        if grant.pending_rate > 0 {
+            grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        }
+        grant.rate_updated_at = env.ledger().timestamp();
+
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("kpimul"), grant_id), (old_rate, grant.flow_rate, multiplier));
+        Ok(())
+    }
+
+    pub fn rage_quit(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        let claim_amount = grant.claimable;
+        let validator_amount = grant.validator_claimable;
+        grant.claimable = 0;
+        grant.validator_claimable = 0;
+        grant.withdrawn = grant.withdrawn.checked_add(claim_amount).ok_or(Error::MathOverflow)?;
+        grant.validator_withdrawn = grant.validator_withdrawn.checked_add(validator_amount).ok_or(Error::MathOverflow)?;
+        grant.status = GrantStatus::RageQuitted;
+
+        let total_paid = grant.withdrawn
+            .checked_add(grant.validator_withdrawn)
+            .ok_or(Error::MathOverflow)?;
+        let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &grant.recipient, &claim_amount);
+
+        // Pay out the validator's accrued share on rage quit
+        if validator_amount > 0 {
+            if let Some(ref validator_addr) = grant.validator {
+                client.transfer(&env.current_contract_address(), validator_addr, &validator_amount);
             }
+        }
+
+        if remaining > 0 {
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+        }
+
+        Ok(())
+    }
+
+    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        require_admin_auth(&env)?;
+
+        if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        // Remaining = total - already withdrawn - pending claimable (both sides)
+        let total_paid = grant.withdrawn
+            .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+            .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+            .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+        let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
+        grant.status = GrantStatus::Cancelled;
+        write_grant(&env, grant_id, &grant);
+
+        if remaining > 0 {
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+        }
+
+        Ok(())
+    }
+
+    pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if amount <= 0 { return Err(Error::InvalidAmount); }
+
+        let client = token::Client::new(&env, &token_address);
+        let balance = client.balance(&env.current_contract_address());
+
+        let total_allocated = if token_address == read_grant_token(&env)? {
+            total_allocated_funds(&env)?
         } else {
             0
         };
 
-        let tax = (taxable_amount * SUSTAINABILITY_TAX_BPS) / BPS_DENOMINATOR;
-        let net = yield_adjusted_amount - tax;
-
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = token::Client::new(&env, &token_addr);
-
-        if tax > 0 {
-            let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-            token_client.transfer(&env.current_contract_address(), &treasury, &tax);
+        if balance.checked_sub(amount).ok_or(Error::MathOverflow)? < total_allocated {
+            return Err(Error::RescueWouldViolateAllocated);
         }
-        
-        token_client.transfer(&env.current_contract_address(), &recipient, &net);
 
-        env.storage().persistent().set(&DataKey::Grant(grant_id), &grant);
+        client.transfer(&env.current_contract_address(), &to, &amount);
+        Ok(())
     }
 
-    pub fn withdraw_as_stable(env: Env, recipient: Address, grant_id: u32, amount: i128, min_stable_out: i128) {
-        recipient.require_auth();
-        let mut grant: Grant = env.storage().persistent().get(&DataKey::Grant(grant_id)).unwrap();
-        
-        if !grant.active { panic!("Grant not active"); }
-        if grant.recipient != recipient { panic!("Not recipient"); }
-        if amount <= 0 || amount > grant.balance { panic!("Invalid amount"); }
+    pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
+        read_grant(&env, grant_id)
+    }
 
-        let current_rate: i128 = env.storage().instance().get(&DataKey::GlobalExchangeRate).unwrap();
-        // Calculate yield-adjusted amount
-        let yield_adjusted_amount = (amount * current_rate) / grant.start_rate;
-
-        grant.balance -= amount;
-        grant.total_volume += amount;
-
-        // compute tax
-        let taxable_amount = if grant.total_volume > VOLUME_THRESHOLD {
-            let total_before = grant.total_volume - amount;
-            if total_before >= VOLUME_THRESHOLD {
-                yield_adjusted_amount
-            } else {
-                (grant.total_volume - VOLUME_THRESHOLD) * current_rate / grant.start_rate
-            }
+    pub fn claimable(env: Env, grant_id: u64) -> i128 {
+        if let Ok(mut grant) = read_grant(&env, grant_id) {
+            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            grant.claimable
         } else {
             0
-        };
+        }
+    }
 
-        let tax = (taxable_amount * SUSTAINABILITY_TAX_BPS) / BPS_DENOMINATOR;
-        let net = yield_adjusted_amount - tax;
-
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let stablecoin_addr: Address = env.storage().instance().get(&DataKey::Stablecoin).unwrap();
-        
-        // Perform path payment to swap token to stablecoin
-        // This is a simplified implementation - in practice, you'd need proper path finding
-        let path: Vec<Address> = Vec::new(&env); // Empty path for direct swap if possible
-        
-        // Call path_payment_strict_receive on the token's asset contract
-        // Arguments: send_asset, send_max, destination, dest_asset, dest_amount, path
-        let args = (
-            token_addr.clone(), // send_asset (the token we're sending)
-            net, // send_max
-            recipient.clone(), // destination
-            stablecoin_addr, // dest_asset
-            min_stable_out, // dest_amount (minimum stablecoin to receive)
-            path, // path
-        );
-        
-        env.invoke_contract::<()>(
-            &token_addr,
-            &soroban_sdk::symbol!("path_payment_strict_receive"),
-            args.into_val(&env),
-        );
-
-        // Handle tax transfer if any
-        if tax > 0 {
-            let token_client = token::Client::new(&env, &token_addr);
-            let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-            token_client.transfer(&env.current_contract_address(), &treasury, &tax);
+    /// Compute the claimable balance for exponential vesting.
+    pub fn compute_exponential_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
         }
 
-        env.storage().persistent().set(&DataKey::Grant(grant_id), &grant);
-    }
-
-    pub fn add_signer(env: Env, admin: Address, signer: Address) {
-        admin.require_auth();
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != current_admin { panic!("Not admin"); }
-
-        let mut count: u32 = env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0);
-        count += 1;
-        env.storage().instance().set(&DataKey::SignerCount, &count);
-        env.storage().instance().set(&DataKey::Signer(count), &signer);
-    }
-
-    pub fn set_threshold(env: Env, admin: Address, threshold: u32) {
-        admin.require_auth();
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != current_admin { panic!("Not admin"); }
-
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
-    }
-
-    pub fn verify_tss_approval(env: Env, message_hash: [u8; 32], signature: Vec<u8>, signer_bitmask: u32) -> bool {
-        // This is a simplified TSS verification - in practice, you'd need proper crypto
-        // For now, just check that enough signers are represented in the bitmask
-        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
-        let signer_count: u32 = env.storage().instance().get(&DataKey::SignerCount).unwrap_or(0);
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
         
-        let mut approved_count = 0u32;
-        for i in 0..signer_count {
-            if (signer_bitmask & (1 << i)) != 0 {
-                approved_count += 1;
+        let progress_squared = match progress.checked_mul(progress) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        let factor_progress = match progress_squared.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        let vested = match total.checked_mul(factor_progress) {
+            Some(v) => v / 1_000_000_000, 
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+
+    /// Compute the claimable balance for logarithmic vesting.
+    pub fn compute_logarithmic_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let progress = (elapsed as u128 * 1000) / (duration as u128);
+        let factor_scaled = factor as u128;
+        
+        if progress == 0 {
+            return 0;
+        }
+        
+        let progress_factor = match progress.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        let sqrt_progress_factor = Self::integer_sqrt(progress_factor);
+        let sqrt_factor = Self::integer_sqrt(factor_scaled);
+        
+        if sqrt_factor == 0 {
+            return 0;
+        }
+        
+        let vested = match total.checked_mul(sqrt_progress_factor) {
+            Some(v) => {
+                let normalized = match v.checked_mul(1000) {
+                    Some(v2) => v2,
+                    None => total,
+                };
+                match normalized.checked_div(sqrt_factor) {
+                    Some(v3) => v3 / 1000,
+                    None => total,
+                }
+            }
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+    
+    fn integer_sqrt(n: u128) -> u128 {
+        if n <= 1 {
+            return n;
+        }
+        
+        let mut low = 1u128;
+        let mut high = n;
+        let mut result = 1u128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            let mid_squared = match mid.checked_mul(mid) {
+                Some(v) => v,
+                None => {
+                    high = mid - 1;
+                    continue;
+                }
+            };
+            
+            if mid_squared == n {
+                return mid;
+            }
+            
+            if mid_squared < n {
+                low = mid + 1;
+                result = mid;
+            } else {
+                high = mid - 1;
             }
         }
         
-    pub fn verify_zk_proof(env: Env, proof: Vec<u8>, public_inputs: Vec<u8>) -> bool {
-        // This is a placeholder for ZK-SNARK verification
-        // In a real implementation, you'd use a proper ZK verification library
-        // and verify against the stored verification key
-        
-        // For now, just return true if proof is not empty
-        !proof.is_empty()
+        result
     }
+
+    pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
+        if let Ok(mut grant) = read_grant(&env, grant_id) {
+            if grant.validator.is_none() {
+                return 0;
+            }
+            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            grant.validator_claimable
+        } else {
+            0
+        }
+    }
+
+    pub fn get_validator_info(
+        env: Env,
+        grant_id: u64,
+    ) -> Result<(Option<Address>, i128, i128), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        Ok((grant.validator, grant.validator_claimable, grant.validator_withdrawn))
+    }
+
+    pub fn withdraw_validator(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        let validator_addr = grant.validator.clone().ok_or(Error::InvalidState)?;
+        validator_addr.require_auth();
+
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        if amount <= 0 || amount > grant.validator_claimable {
+            return Err(Error::InvalidAmount);
+        }
+
+        grant.validator_claimable = grant.validator_claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
+        grant.validator_withdrawn = grant.validator_withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
+
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &validator_addr, &amount);
+
+        env.events().publish((symbol_short!("valwdraw"), grant_id), amount);
+        Ok(())
+    }
+
+    pub fn set_legal_metadata(
+        env: Env,
+        grant_id: u64,
+        legal_hash: String,
+        requires_signature: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.legal_hash = Some(legal_hash);
+        grant.requires_legal_signature = requires_signature;
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("legalset"), grant_id), requires_signature);
+        Ok(())
+    }
+
+    pub fn sign_legal_metadata(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+        if grant.legal_hash.is_none() { return Err(Error::InvalidState); }
+        grant.is_legal_signed = true;
+        grant.last_update_ts = env.ledger().timestamp();
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("legalsig"), grant_id), env.ledger().timestamp());
+        Ok(())
+    }
+
+    pub fn emit_grant_status(env: Env, grant_id: u64) -> Result<soroban_sdk::Bytes, Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        let total_value = grant.total_amount;
+        let progress_accrued = grant.withdrawn + grant.claimable + grant.validator_withdrawn + grant.validator_claimable;
+        let progress_bps = if total_value > 0 { (progress_accrued * 10000) / total_value } else { 0 };
+        let mut data = Bytes::new(&env);
+        data.append(&grant_id.to_xdr(&env));
+        data.append(&total_value.to_xdr(&env));
+        data.append(&progress_bps.to_xdr(&env));
+        env.events().publish((symbol_short!("grntstat"), grant_id), data.clone());
+        Ok(data)
+    }
+}
+
+fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
+    let args = (grant_id, amount).into_val(env);
+    let _ = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+        recipient,
+        &Symbol::new(env, "on_withdraw"),
+        args,
+    );
+}
+
+#[cfg(test)]
+mod test;

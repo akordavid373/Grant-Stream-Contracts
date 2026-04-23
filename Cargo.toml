@@ -2,13 +2,14 @@
 resolver = "2"
 members = [
     "contracts/grant_stream",
+    "contracts/vesting_contracts",
     "contracts/arbitration",
     "contracts/compliance",
     "contracts/zk_kyc"
 ]
 
 [workspace.dependencies]
-soroban-sdk = "20.5.0"
+soroban-sdk = "22.0.0"
 
 [profile.release]
 opt-level = "z"
@@ -23,3 +24,6 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
+[profile.dev]
+panic = "abort"
