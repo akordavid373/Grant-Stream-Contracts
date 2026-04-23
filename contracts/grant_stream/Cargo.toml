@@ -1,25 +1,15 @@
 [package]
-name = "grant_contracts"
-version = "0.0.0"
+name = "grant_stream"
+version = "0.1.0"
 edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["lib", "cdylib"]
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-
-[profile.dev]
-panic = "abort"
+soroban-sdk = { workspace = true, features = ["testutils"] }

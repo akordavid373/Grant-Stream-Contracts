@@ -20,3 +20,9 @@ Thumbs.db
 # Backup files
 *.bak
 *.backup
+
+# Tooling
+node_modules/
+artifacts/
+cache/
+.env
