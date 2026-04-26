@@ -861,3 +861,5 @@ mod test_concurrent_withdraw;
 mod test_rounding_fuzz;
 #[cfg(test)]
 mod test_temporal_fuzz;
+#[cfg(test)]
+mod test_global_invariant_fuzz;
