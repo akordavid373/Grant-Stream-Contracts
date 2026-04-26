@@ -16,6 +16,7 @@ pub mod multi_token;
 pub mod yield_treasury;
 pub mod optimized;
 mod self_terminate;
+pub mod circuit_breakers;
 
 // --- Types ---
 
@@ -102,6 +103,8 @@ pub enum Error {
     NotValidator = 14,
     LegalSignatureRequired = 15,
     GrantNotPurgeable = 16,
+    OraclePriceFrozen = 17,
+    SoftPaused = 18,
 }
 
 // --- Internal Helpers ---
@@ -386,6 +389,11 @@ impl GrantStreamContract {
             return Err(Error::InvalidState);
         }
 
+        // Issue #311: reject withdrawals while SoftPause is active.
+        if circuit_breakers::is_soft_paused(&env) {
+            return Err(Error::SoftPaused);
+        }
+
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
@@ -401,6 +409,9 @@ impl GrantStreamContract {
         grant.last_claim_time = env.ledger().timestamp();
 
         write_grant(&env, grant_id, &grant);
+
+        // Issue #311: record withdrawal velocity; may engage SoftPause.
+        circuit_breakers::record_withdrawal_velocity(&env, amount);
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
@@ -474,6 +485,11 @@ impl GrantStreamContract {
     pub fn apply_kpi_multiplier(env: Env, grant_id: u64, multiplier: i128) -> Result<(), Error> {
         require_oracle_auth(&env)?;
         if multiplier <= 0 { return Err(Error::InvalidRate); }
+
+        // Issue #312: block price-dependent operations while oracle is frozen.
+        if circuit_breakers::is_oracle_frozen(&env) {
+            return Err(Error::OraclePriceFrozen);
+        }
 
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
@@ -588,6 +604,61 @@ impl GrantStreamContract {
         client.transfer(&env.current_contract_address(), &to, &amount);
         Ok(())
     }
+
+    // ── Circuit Breaker: Oracle Price Deviation Guard (Issue #312) ────────────
+
+    /// Configure the sanity-check oracle address.  Admin only.
+    pub fn set_sanity_oracle(env: Env, sanity_oracle: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        circuit_breakers::set_sanity_oracle(&env, &sanity_oracle);
+        Ok(())
+    }
+
+    /// Submit a new oracle price ping.  If the price deviates >50% from the
+    /// last accepted price the oracle guard is tripped and `false` is returned.
+    /// Requires oracle auth.
+    pub fn submit_oracle_price(env: Env, new_price: i128) -> Result<bool, Error> {
+        require_oracle_auth(&env)?;
+        if new_price <= 0 { return Err(Error::InvalidAmount); }
+        Ok(circuit_breakers::record_oracle_price(&env, new_price))
+    }
+
+    /// Sanity-check oracle confirms a suspicious price, clearing the freeze.
+    pub fn confirm_oracle_price(env: Env, caller: Address, confirmed_price: i128) -> Result<(), Error> {
+        if confirmed_price <= 0 { return Err(Error::InvalidAmount); }
+        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price);
+        Ok(())
+    }
+
+    /// Returns whether the oracle price circuit breaker is currently active.
+    pub fn oracle_frozen(env: Env) -> bool {
+        circuit_breakers::is_oracle_frozen(&env)
+    }
+
+    // ── Circuit Breaker: TVL Velocity Limit (Issue #311) ──────────────────────
+
+    /// Update the TVL snapshot used for velocity-limit calculations.  Admin only.
+    pub fn update_tvl_snapshot(env: Env, total_liquidity: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if total_liquidity < 0 { return Err(Error::InvalidAmount); }
+        circuit_breakers::update_tvl_snapshot(&env, total_liquidity);
+        Ok(())
+    }
+
+    /// Returns whether the contract is currently in SoftPause.
+    pub fn soft_paused(env: Env) -> bool {
+        circuit_breakers::is_soft_paused(&env)
+    }
+
+    /// Admin resumes normal operations after manual verification of a velocity breach.
+    pub fn resume_after_velocity_check(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+        circuit_breakers::resume_after_velocity_check(&env, &admin);
+        Ok(())
+    }
+
+    // ── Standard getters ──────────────────────────────────────────────────────
 
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
         read_grant(&env, grant_id)
