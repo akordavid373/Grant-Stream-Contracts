@@ -857,3 +857,5 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
 mod test;
 #[cfg(test)]
 mod test_concurrent_withdraw;
+#[cfg(test)]
+mod test_rounding_fuzz;
