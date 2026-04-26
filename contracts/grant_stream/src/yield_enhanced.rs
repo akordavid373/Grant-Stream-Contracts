@@ -217,7 +217,7 @@ impl YieldEnhancedGrantContract {
         }
         
         env.events().publish(
-            (symbol_short!("enhanced_init"),),
+            (symbol_short!("en_init"),),
             (admin, enable_treasury),
         );
         
@@ -277,7 +277,7 @@ impl YieldEnhancedGrantContract {
         env.storage().instance().set(&key, &enhanced_grant);
         
         env.events().publish(
-            (symbol_short!("enhanced_grant_created"),),
+            (symbol_short!("en_create"),),
             (grant_id, recipient, yield_enabled),
         );
         
@@ -358,7 +358,7 @@ impl YieldEnhancedGrantContract {
         yield_token.transfer(&env.current_contract_address(), &enhanced_grant.base_grant.recipient, &amount);
         
         env.events().publish(
-            (symbol_short!("enhanced_withdraw"),),
+            (symbol_short!("en_wdraw"),),
             (grant_id, amount, enhanced_grant.base_grant.recipient),
         );
         
@@ -453,7 +453,7 @@ impl YieldEnhancedGrantContract {
         env.storage().instance().set(&EnhancedDataKey::YieldMetrics, &metrics);
         
         env.events().publish(
-            (symbol_short!("yield_invest"),),
+            (symbol_short!("yld_inv"),),
             (amount, investment_strategy, apy),
         );
         
@@ -596,7 +596,7 @@ impl YieldEnhancedGrantContract {
         env.storage().instance().set(&EnhancedDataKey::YieldMetrics, &metrics);
         
         env.events().publish(
-            (symbol_short!("yield_divest"),),
+            (symbol_short!("yld_div"),),
             (divest_amount, investment_return, yield_return),
         );
         
@@ -683,7 +683,7 @@ impl YieldEnhancedGrantContract {
         env.storage().instance().set(&EnhancedDataKey::ReserveBalance, &new_reserve);
         
         env.events().publish(
-            (symbol_short!("emergency_divest"),),
+            (symbol_short!("em_divest"),),
             (divest_amount, needed_amount),
         );
         

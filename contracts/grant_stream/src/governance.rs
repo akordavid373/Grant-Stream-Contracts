@@ -223,11 +223,9 @@ impl GovernanceContract {
         env.storage().instance().set(&GovernanceDataKey::CouncilMembers, &member_bytes);
 
         env.events().publish(
-            (symbol_short!("council_set"),),
+            (symbol_short!("cncl_set"),),
             member_bytes.len(),
         );
-        env.storage().instance().set(&GovernanceDataKey::StakeToken, &stake_token);
-        env.storage().instance().set(&GovernanceDataKey::ProposalStakeAmount, &proposal_stake_amount);
 
         Ok(())
     }
@@ -408,6 +406,7 @@ impl GovernanceContract {
             return Err(GovernanceError::VotingEnded);
         }
 
+        let voting_power = Self::calculate_voting_power(&env, &voter)?;
         let mut conviction_record = env.storage().instance().get::<_, VotingPower>(&GovernanceDataKey::VotingPower(voter.clone())).unwrap_or(VotingPower {
             address: voter.clone(),
             token_balance: 0,
@@ -456,7 +455,7 @@ impl GovernanceContract {
 
         env.events().publish(
             (symbol_short!("quad_vote"), proposal_id),
-            (voter, weight, voting_power, quadratic_weight),
+            (voter, weight, voting_power, conviction_weight),
         );
 
         Ok(())
@@ -473,6 +472,7 @@ impl GovernanceContract {
             address: address.clone(),
             token_balance,
             voting_power,
+            conviction: 0, // Default to 0 when recalculating power
             last_updated: env.ledger().timestamp(),
         };
 

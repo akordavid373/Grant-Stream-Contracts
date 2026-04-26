@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
 };
 
 use super::optimized::{
@@ -100,7 +100,7 @@ impl GrantContract {
             final_claimable,
             refunded_amount: remaining_balance,
             terminated_at: env.ledger().timestamp(),
-            termination_reason: "Self-terminated by grantee".to_string(),
+            termination_reason: String::from_str(&env, "Self-terminated by grantee"),
         };
         
         // Emit termination event
@@ -139,7 +139,7 @@ impl GrantContract {
             final_claimable: grant.claimable,
             refunded_amount: remaining_balance,
             terminated_at: grant.rate_updated_at, // Use as approximation
-            termination_reason: "Self-terminated by grantee".to_string(),
+            termination_reason: String::from_str(&env, "Self-terminated by grantee"),
         })
     }
     
@@ -204,7 +204,7 @@ impl SelfTerminateResult {
         // TODO: Implement actual token transfer logic
         
         env.events().publish(
-            (symbol_short!("grantee_settle"), grant.recipient.clone()),
+            (symbol_short!("grnt_setl"), grant.recipient.clone()),
             (amount, "Final claimable amount settled"),
         );
         
@@ -224,7 +224,7 @@ impl SelfTerminateResult {
         // TODO: Implement actual token transfer logic
         
         env.events().publish(
-            (symbol_short!("admin_refund"), admin),
+            (symbol_short!("adm_refnd"), admin),
             (amount, "Unspent grant balance refunded"),
         );
         

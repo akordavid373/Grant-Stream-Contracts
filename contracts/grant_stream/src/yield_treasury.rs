@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, 
-    token, Token, Vec, Map, TryIntoVal, TryFromVal, symbol,
+    token, Vec, Map, IntoVal, TryIntoVal, TryFromVal, Symbol,
 };
 
 #[contract]
@@ -153,7 +153,7 @@ fn write_reserve_balance(env: &Env, balance: i128) {
     env.storage().instance().set(&DataKey::ReserveBalance, &balance);
 }
 
-fn read_yield_token(env: &Env) -> Result<Token, YieldError> {
+fn read_yield_token(env: &Env) -> Result<token::Client, YieldError> {
     let token_address = env
         .storage()
         .instance()
@@ -254,7 +254,7 @@ impl YieldTreasuryContract {
         
         // Initialize config
         let config = TreasuryConfig {
-            admin,
+            admin: admin.clone(),
             min_reserve_ratio: initial_config.min_reserve_ratio,
             max_investment_ratio: initial_config.max_investment_ratio,
             auto_invest: initial_config.auto_invest,
@@ -263,7 +263,7 @@ impl YieldTreasuryContract {
             max_slippage: initial_config.max_slippage,
             external_vault: initial_config.external_vault,
         };
-        write_config(env, &config);
+        write_config(&env, &config);
         
         // Initialize metrics
         let metrics = YieldMetrics {
@@ -273,13 +273,13 @@ impl YieldTreasuryContract {
             last_yield_calculation: env.ledger().timestamp(),
             investment_count: 0,
         };
-        write_metrics(env, &metrics);
+        write_metrics(&env, &metrics);
         
         // Initialize reserve balance
-        write_reserve_balance(env, 0);
+        write_reserve_balance(&env, 0);
         
         env.events().publish(
-            (symbol_short!("yield_init"), admin.clone(), yield_token_address.clone()),
+            (symbol_short!("yld_init"), admin.clone(), yield_token_address.clone()),
             (admin, yield_token_address),
         );
         
@@ -326,13 +326,13 @@ impl YieldTreasuryContract {
             let vault_addr = config.external_vault.as_ref().ok_or(YieldError::InvalidStrategy)?;
             
             // Approve vault to spend tokens
-            yield_token.approve(&env.current_contract_address(), vault_addr, &amount, &env.ledger().timestamp().saturating_add(3600));
+            yield_token.approve(&env.current_contract_address(), vault_addr, &amount, &(env.ledger().sequence().saturating_add(500)));
             
             // Call external vault deposit
             let shares_minted: i128 = env.invoke_contract(
                 vault_addr,
-                &symbol!("deposit"),
-                (env.current_contract_address(), amount).into_val(&env),
+                &Symbol::new(&env, "deposit"),
+                Vec::from_array(&env, [env.current_contract_address().into_val(&env), amount.into_val(&env)]),
             );
             
             if shares_minted <= 0 {
@@ -531,7 +531,7 @@ impl YieldTreasuryContract {
         write_config(&env, &new_config);
         
         env.events().publish(
-            (symbol_short!("config_update"),),
+            (symbol_short!("cfg_updt"),),
             (new_config.min_reserve_ratio, new_config.max_investment_ratio),
         );
         
@@ -566,7 +566,7 @@ impl YieldTreasuryContract {
         yield_token.transfer(&env.current_contract_address(), &recipient, &amount);
         
         env.events().publish(
-            (symbol_short!("emergency_withdraw"),),
+            (symbol_short!("em_wdraw"),),
             (amount, recipient),
         );
         
@@ -645,8 +645,8 @@ impl YieldTreasuryContract {
             // Get current value from external vault
             let total_value: i128 = env.invoke_contract(
                 vault_addr,
-                &symbol!("get_total_value"),
-                ().into_val(&env),
+                &Symbol::new(&env, "get_total_value"),
+                Vec::new(&env),
             );
             
             if total_value > position.current_value {

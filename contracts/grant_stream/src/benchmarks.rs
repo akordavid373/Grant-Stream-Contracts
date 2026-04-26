@@ -23,7 +23,7 @@ impl GasBenchmark {
 }
 
 pub fn run_benchmarks() -> Vec<GasBenchmark> {
-    let mut benchmarks = Vec::new();
+    let mut benchmarks: Vec<GasBenchmark> = Vec::new();
     
     // Benchmark 1: Grant Creation
     let (gas_used, storage_cost, cpu_cost) = benchmark_grant_creation();

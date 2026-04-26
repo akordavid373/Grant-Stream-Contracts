@@ -13,7 +13,7 @@ use super::optimized::{
 
 fn emit_multi_token_snapshot(env: &Env, grant_id: u64, grant: &MultiTokenGrant) {
     env.events().publish(
-        (symbol_short!("mt_snapshot"), grant_id),
+        (symbol_short!("mt_snap"), grant_id),
         (grant.tokens.len(), grant.status_mask, grant.last_update_ts),
     );
 }
@@ -112,7 +112,7 @@ impl GrantContract {
         Self::validate_token_balances(&tokens)?;
 
         // Check for duplicate tokens
-        Self::check_duplicate_tokens(&tokens)?;
+        Self::check_duplicate_tokens(&env, &tokens)?;
 
         // Check if grant already exists
         let key = DataKey::Grant(grant_id);
@@ -283,7 +283,7 @@ impl GrantContract {
 
         // Emit rate update event
         env.events().publish(
-            (symbol_short!("multi_rateupdt"), grant_id),
+            (symbol_short!("mt_rateup"), grant_id),
             (token_updates.len(), grant.rate_updated_at),
         );
         emit_multi_token_snapshot(&env, grant_id, &grant);
@@ -321,7 +321,7 @@ impl GrantContract {
 
         // Emit token addition event
         env.events().publish(
-            (symbol_short!("token_added"), grant_id),
+            (symbol_short!("tkn_add"), grant_id),
             (grant.tokens.len(), env.ledger().timestamp()),
         );
 
@@ -372,7 +372,7 @@ impl GrantContract {
 
         // Emit token removal event
         env.events().publish(
-            (symbol_short!("token_removed"), grant_id),
+            (symbol_short!("tkn_rem"), grant_id),
             (token_address, grant.tokens.len()),
         );
 
@@ -463,12 +463,12 @@ impl GrantContract {
     }
 
     /// Check for duplicate tokens
-    fn check_duplicate_tokens(tokens: &Vec<TokenBalance>) -> Result<(), Error> {
-        let mut seen = Vec::new();
+    fn check_duplicate_tokens(env: &Env, tokens: &Vec<TokenBalance>) -> Result<(), Error> {
+        let mut seen: Vec<Address> = Vec::new(env);
         
         for token in tokens.iter() {
             for existing in seen.iter() {
-                if *existing == token.token_address {
+                if existing == token.token_address {
                     return Err(Error::GrantAlreadyExists);
                 }
             }
@@ -494,7 +494,8 @@ impl GrantContract {
         let elapsed_i128 = i128::from(elapsed);
 
         // Settle each token
-        for token_balance in grant.tokens.iter_mut() {
+        for i in 0..grant.tokens.len() {
+            let mut token_balance = grant.tokens.get(i).unwrap();
             if token_balance.flow_rate == 0 {
                 continue;
             }
@@ -528,6 +529,8 @@ impl GrantContract {
                 .claimable
                 .checked_add(delta)
                 .ok_or(Error::MathOverflow)?;
+            
+            grant.tokens.set(i, token_balance);
         }
 
         Ok(())
@@ -553,7 +556,7 @@ impl GrantContract {
 
         let token_index = token_index.ok_or(Error::GrantNotFound)?;
 
-        let token_balance = &mut grant.tokens[token_index];
+        let mut token_balance = grant.tokens.get(token_index as u32).unwrap();
 
         // Check claimable amount
         if withdrawal.amount > token_balance.claimable {
@@ -570,6 +573,8 @@ impl GrantContract {
             .withdrawn
             .checked_add(withdrawal.amount)
             .ok_or(Error::MathOverflow)?;
+        
+        grant.tokens.set(token_index as u32, token_balance);
 
         // In a real implementation, this would transfer the token
         // For now, we'll simulate the transfer
@@ -589,9 +594,11 @@ impl GrantContract {
         }
 
         // Find the token
-        for token_balance in grant.tokens.iter_mut() {
+        for i in 0..grant.tokens.len() {
+            let mut token_balance = grant.tokens.get(i).unwrap();
             if token_balance.token_address == *token_address {
                 token_balance.flow_rate = new_flow_rate;
+                grant.tokens.set(i, token_balance);
                 return Ok(());
             }
         }

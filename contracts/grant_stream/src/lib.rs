@@ -101,6 +101,7 @@ pub enum Error {
     GrantNotInactive = 13,
     NotValidator = 14,
     LegalSignatureRequired = 15,
+    GrantNotPurgeable = 16,
 }
 
 // --- Internal Helpers ---
@@ -841,6 +842,67 @@ impl GrantStreamContract {
             Ok(hf) => Ok(hf),
             Err(_) => Err(Error::MathOverflow), // Map to generic error for simplicity
         }
+    }
+
+    /// Finalizes and purges a completed or cancelled grant to clean up state.
+    /// Rewards the purger with a small bounty from the treasury/contract.
+    pub fn finalize_and_purge(env: Env, grant_id: u64, purger: Address) -> Result<(), Error> {
+        purger.require_auth();
+
+        let mut grant = read_grant(&env, grant_id)?;
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        // Verify eligibility for purging
+        // 1. Must be Completed or Cancelled
+        if grant.status != GrantStatus::Completed && grant.status != GrantStatus::Cancelled {
+            return Err(Error::GrantNotPurgeable);
+        }
+
+        // 2. Must have no pending claims
+        if grant.claimable > 0 || grant.validator_claimable > 0 {
+            return Err(Error::GrantNotPurgeable);
+        }
+
+        // Cleanup state: Remove grant from storage
+        env.storage().instance().remove(&DataKey::Grant(grant_id));
+
+        // Update grant ID tracking lists
+        let ids = read_grant_ids(&env);
+        let mut new_ids: Vec<u64> = Vec::new(&env);
+        for id in ids.iter() {
+            if id != grant_id {
+                new_ids.push_back(id);
+            }
+        }
+        env.storage().instance().set(&DataKey::GrantIds, &new_ids);
+
+        let recipient_key = DataKey::RecipientGrants(grant.recipient.clone());
+        if let Some(user_grants) = env.storage().instance().get::<_, Vec<u64>>(&recipient_key) {
+            let mut new_user_grants: Vec<u64> = Vec::new(&env);
+            for id in user_grants.iter() {
+                if id != grant_id {
+                    new_user_grants.push_back(id);
+                }
+            }
+            env.storage().instance().set(&recipient_key, &new_user_grants);
+        }
+
+        // Incentive: Bounty from native token (XLM)
+        // 100,000 stroops (0.01 XLM) as a symbolic cleanup reward
+        let bounty_amount: i128 = 100_000; 
+        let native_token_addr: Address = env.storage().instance().get(&DataKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        
+        if native_client.balance(&env.current_contract_address()) >= bounty_amount {
+            native_client.transfer(&env.current_contract_address(), &purger, &bounty_amount);
+        }
+
+        env.events().publish(
+            (symbol_short!("purge"), grant_id, purger),
+            bounty_amount,
+        );
+
+        Ok(())
     }
 }
 
