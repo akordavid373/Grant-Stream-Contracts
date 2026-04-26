@@ -925,3 +925,5 @@ mod test_rounding_fuzz;
 mod test_temporal_fuzz;
 #[cfg(test)]
 mod test_global_invariant_fuzz;
+#[cfg(test)]
+mod test_reentrancy_fuzz;
