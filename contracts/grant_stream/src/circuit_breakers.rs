@@ -24,6 +24,10 @@ const TVL_DRAIN_BPS: i128 = 2_000;
 const VELOCITY_WINDOW_SECS: u64 = 6 * 60 * 60;
 /// 48-hour oracle heartbeat interval.
 const ORACLE_HEARTBEAT_INTERVAL_SECS: u64 = 48 * 60 * 60;
+/// 24-hour dispute monitoring window.
+const DISPUTE_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// 15% dispute threshold (in basis points: 1500 / 10000 = 15%).
+const DISPUTE_THRESHOLD_BPS: i128 = 1_500;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -49,6 +53,14 @@ pub enum CircuitBreakerKey {
     OracleFrozenDueToNoHeartbeat,
     /// Manual exchange rate set by DAO.
     ManualExchangeRate,
+    /// Timestamp when the current dispute monitoring window started (u64).
+    DisputeWindowStart,
+    /// Number of disputes in the current 24-hour window (u32).
+    DisputeAccumulator,
+    /// Number of active grants at window start (u32).
+    ActiveGrantsSnapshot,
+    /// Whether new grant initialization is halted due to mass dispute trigger.
+    GrantInitializationHalted,
 }
 
 // ── Oracle Price Guard (Issue #312) ───────────────────────────────────────────
@@ -278,4 +290,124 @@ pub fn resume_after_velocity_check(env: &Env, admin: &Address) {
     env.storage()
         .instance()
         .set(&CircuitBreakerKey::VelocityAccumulator, &0_i128);
+}
+
+// ── Mass Milestone Dispute Trigger (Sybil-Dispute Attack Protection) ─────────
+
+/// Record a new dispute and check whether the mass dispute threshold has been breached.
+///
+/// Returns `true` if the dispute is recorded normally, `false` if the threshold
+/// was just breached and grant initialization has been halted.
+///
+/// This function should be called whenever a grant is placed into "Dispute" status.
+pub fn record_dispute(env: &Env, active_grants_count: u32) -> bool {
+    let now: u64 = env.ledger().timestamp();
+    let window_start: u64 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeWindowStart)
+        .unwrap_or(now);
+    let mut accumulator: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeAccumulator)
+        .unwrap_or(0);
+
+    // Reset window if it has expired (24 hours).
+    if now.saturating_sub(window_start) >= DISPUTE_WINDOW_SECS {
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::DisputeWindowStart, &now);
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::ActiveGrantsSnapshot, &active_grants_count);
+        accumulator = 0;
+    }
+
+    // Update the active grants snapshot if this is the first dispute in the window
+    if accumulator == 0 {
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::ActiveGrantsSnapshot, &active_grants_count);
+    }
+
+    accumulator = accumulator.saturating_add(1);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::DisputeAccumulator, &accumulator);
+
+    // Check if disputes exceed 15% of active grants
+    let snapshot_grants: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::ActiveGrantsSnapshot)
+        .unwrap_or(active_grants_count);
+
+    if snapshot_grants > 0 {
+        let dispute_percentage_bps = (accumulator as i128)
+            .saturating_mul(10_000)
+            .checked_div(snapshot_grants as i128)
+            .unwrap_or(i128::MAX);
+
+        if dispute_percentage_bps >= DISPUTE_THRESHOLD_BPS {
+            // Trip the circuit breaker - halt new grant initializations
+            env.storage()
+                .instance()
+                .set(&CircuitBreakerKey::GrantInitializationHalted, &true);
+            return false; // threshold breached; grant initialization halted
+        }
+    }
+
+    true
+}
+
+/// Returns `true` when new grant initialization is halted due to mass dispute trigger.
+pub fn is_grant_initialization_halted(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&CircuitBreakerKey::GrantInitializationHalted)
+        .unwrap_or(false)
+}
+
+/// Admin-only: resume grant initialization after manual verification of dispute activity.
+/// This should only be called after the admin has investigated the dispute pattern
+/// and determined it was not a coordinated Sybil attack.
+pub fn resume_grant_initialization(env: &Env, admin: &Address) {
+    admin.require_auth();
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::GrantInitializationHalted, &false);
+    // Reset the dispute window so the 24-hour clock starts fresh.
+    let now: u64 = env.ledger().timestamp();
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::DisputeWindowStart, &now);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::DisputeAccumulator, &0_u32);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::ActiveGrantsSnapshot, &0_u32);
+}
+
+/// Get current dispute monitoring statistics for transparency.
+pub fn get_dispute_monitoring_stats(env: &Env) -> (u64, u32, u32, bool) {
+    let window_start: u64 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeWindowStart)
+        .unwrap_or(0);
+    let dispute_count: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeAccumulator)
+        .unwrap_or(0);
+    let active_grants_snapshot: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::ActiveGrantsSnapshot)
+        .unwrap_or(0);
+    let halted: bool = is_grant_initialization_halted(env);
+
+    (window_start, dispute_count, active_grants_snapshot, halted)
 }
