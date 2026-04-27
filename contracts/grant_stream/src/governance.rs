@@ -25,6 +25,13 @@ pub enum ProposalStatus {
     Challenged,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ProposalType {
+    General,
+    SetManualExchangeRate(i128),
+}
+
 #[derive(Clone, Debug)]
 #[contracttype]
 pub struct Proposal {
@@ -41,6 +48,8 @@ pub struct Proposal {
     pub stake_returned: bool,
     pub is_optimistic: bool,
     pub challenge_deadline: u64,
+    pub proposal_type: ProposalType,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -279,9 +288,11 @@ impl GovernanceContract {
             yes_votes: 0,
             no_votes: 0,
             total_voting_power: 0,
-            created_at: now,
             stake_amount,
             stake_returned: false,
+            is_optimistic: false,
+            challenge_deadline: 0,
+            proposal_type: ProposalType::General,
         };
 
         env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
@@ -331,11 +342,12 @@ impl GovernanceContract {
             yes_votes: 0,
             no_votes: 0,
             total_voting_power: 0,
-            created_at: now,
             stake_amount,
             stake_returned: false,
             is_optimistic: true,
             challenge_deadline,
+            proposal_type: ProposalType::General,
+            created_at: now,
         };
 
         env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
@@ -345,6 +357,58 @@ impl GovernanceContract {
         env.events().publish(
             (symbol_short!("opti_new"), proposal_id, proposer),
             (amount, challenge_deadline),
+        );
+
+        Ok(proposal_id)
+    }
+
+    pub fn create_set_manual_exchange_rate_proposal(
+        env: Env,
+        proposer: Address,
+        rate: i128,
+        voting_period: u64,
+    ) -> Result<u64, GovernanceError> {
+        proposer.require_auth();
+
+        let stake_token = Self::get_stake_token(&env)?;
+        let stake_amount = Self::get_proposal_stake_amount(&env)?;
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&proposer, &env.current_contract_address(), &stake_amount);
+
+        let now = env.ledger().timestamp();
+        let voting_deadline = now.checked_add(voting_period).ok_or(GovernanceError::MathOverflow)?;
+
+        let mut proposal_ids = Self::get_proposal_ids(&env)?;
+        let proposal_id = if proposal_ids.is_empty() { 0 } else { proposal_ids.get(proposal_ids.len() - 1).unwrap() + 1 };
+
+        let title = String::from_str(&env, "Set Manual Exchange Rate");
+        let description = String::from_str(&env, &format!("Set manual exchange rate to {}", rate));
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            title,
+            description,
+            voting_deadline,
+            status: ProposalStatus::Active,
+            yes_votes: 0,
+            no_votes: 0,
+            total_voting_power: 0,
+            stake_amount,
+            stake_returned: false,
+            is_optimistic: false,
+            challenge_deadline: 0,
+            proposal_type: ProposalType::SetManualExchangeRate(rate),
+            created_at: now,
+        };
+
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+        proposal_ids.push_back(proposal_id);
+        env.storage().instance().set(&GovernanceDataKey::ProposalIds, &proposal_ids);
+
+        env.events().publish(
+            (symbol_short!("prop_new"), proposal_id, proposer.clone()),
+            (proposer, voting_deadline),
         );
 
         Ok(proposal_id)
@@ -530,7 +594,14 @@ impl GovernanceContract {
         }
 
         let total_votes = proposal.yes_votes.checked_add(proposal.no_votes).unwrap_or(0);
-        if total_votes == 0 || proposal.yes_votes < voting_threshold {
+        let required_threshold = match proposal.proposal_type {
+            ProposalType::SetManualExchangeRate(_) => {
+                // 90% majority required
+                proposal.total_voting_power * 90 / 100
+            }
+            _ => voting_threshold,
+        };
+        if total_votes == 0 || proposal.yes_votes < required_threshold {
             proposal.status = ProposalStatus::Rejected;
             env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
             return Err(GovernanceError::ThresholdNotMet);
@@ -538,6 +609,14 @@ impl GovernanceContract {
 
         proposal.status = ProposalStatus::Executed;
         env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+        // Execute the proposal action
+        match proposal.proposal_type {
+            ProposalType::SetManualExchangeRate(rate) => {
+                super::circuit_breakers::set_manual_exchange_rate(&env, rate);
+            }
+            _ => {}
+        }
 
         env.events().publish(
             (symbol_short!("prop_exec"), proposal_id),
