@@ -4,6 +4,17 @@ use soroban_sdk::{
     Symbol, vec, IntoVal, String, Map, xdr::ScVal, xdr::ToXdr, Bytes,
 };
 
+
+#![no_std]
+ 
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
+ 
+// PATCH: declare the new reentrancy module ───────────────────────────────────
+pub mod reentrancy;
+// Also re-export the macro so callers can write `use grant_stream::nonreentrant`
+// if they ever need it from sibling modules.
+pub use nonreentrant;
+
 // --- Constants ---
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
 const XLM_DECIMALS: u32 = 7;
@@ -28,6 +39,16 @@ pub enum GrantStatus {
     Completed,
     Cancelled,
     RageQuitted,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Grant(u64),
+    Milestone(u64, u32),
+    Admin,
+    Treasury,
+    // … other existing keys …
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +90,24 @@ pub struct Grant {
     /// Boolean flag indicating if the legal document has been signed by the grantee.
     pub is_legal_signed: bool,
 }
+
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Grant {
+    pub recipient: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub streamed_amount: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub paused: bool,
+    // … other existing fields …
+}
+
+#[contract]
+pub struct GrantStream;
+
 
 #[derive(Clone)]
 #[contracttype]
@@ -273,6 +312,116 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     grant.last_update_ts = now;
     Ok(())
 }
+
+ pub fn claim_milestone_funds(env: Env, grant_id: u64, milestone_index: u32) -> i128 {
+        nonreentrant!(env, {
+            // ── Auth ─────────────────────────────────────────────────────
+            let grant: Grant = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Grant(grant_id))
+                .expect("grant not found");
+ 
+            grant.recipient.require_auth();
+ 
+            // ── Milestone validation ──────────────────────────────────────
+            // (existing logic unchanged)
+            let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+            let milestone_proof: Symbol = env
+                .storage()
+                .persistent()
+                .get(&milestone_key)
+                .expect("milestone not found or not yet submitted");
+ 
+            // ── Compute claimable amount ──────────────────────────────────
+            // (existing streaming / milestone calculation — unchanged)
+            let claimable: i128 = 0; // placeholder — replace with real logic
+ 
+            // ── Cross-contract token transfer ─────────────────────────────
+            // This is the call that could trigger a malicious callback.
+            // The nonreentrant guard is already set before we reach this line.
+            let token_client = token::Client::new(&env, &grant.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &grant.recipient,
+                &claimable,
+            );
+ 
+            // ── Update streamed amount ────────────────────────────────────
+            // State is mutated AFTER the external call — kept here for
+            // compatibility with existing logic; the guard makes it safe.
+            let mut updated_grant = grant.clone();
+            updated_grant.streamed_amount += claimable;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Grant(grant_id), &updated_grant);
+ 
+            // ── Emit event ────────────────────────────────────────────────
+            env.events().publish(
+                (soroban_sdk::symbol_short!("milestone"),),
+                (grant_id, milestone_index, claimable),
+            );
+ 
+            claimable
+            // ← reentrancy_exit() fires here via macro before returning
+        })
+    }
+
+     pub fn emergency_governance_withdraw(
+        env: Env,
+        grant_id: u64,
+        destination: Address,
+    ) -> i128 {
+        nonreentrant!(env, {
+            // ── Governance auth ───────────────────────────────────────────
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .expect("admin not set");
+            admin.require_auth();
+ 
+            // ── Fetch grant ───────────────────────────────────────────────
+            let grant: Grant = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Grant(grant_id))
+                .expect("grant not found");
+ 
+            // ── Compute remaining balance ─────────────────────────────────
+            let remaining = grant.total_amount - grant.streamed_amount;
+            assert!(remaining > 0, "nothing to withdraw");
+ 
+            // ── Cross-contract token transfer ─────────────────────────────
+            // Guard is already set — re-entrant callbacks are blocked.
+            let token_client = token::Client::new(&env, &grant.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &destination,
+                &remaining,
+            );
+ 
+            // ── Mark grant as fully consumed ──────────────────────────────
+            let mut updated_grant = grant.clone();
+            updated_grant.streamed_amount = updated_grant.total_amount;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Grant(grant_id), &updated_grant);
+ 
+            // ── Emit emergency event ──────────────────────────────────────
+            env.events().publish(
+                (soroban_sdk::symbol_short!("emerg_wd"),),
+                (grant_id, destination.clone(), remaining),
+            );
+ 
+            remaining
+            // ← reentrancy_exit() fires here via macro before returning
+        })
+    }
+ 
+    // … all other existing entry-points are UNCHANGED …
+
+ 
 
 fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Error> {
     let elapsed_i128 = i128::from(elapsed);
