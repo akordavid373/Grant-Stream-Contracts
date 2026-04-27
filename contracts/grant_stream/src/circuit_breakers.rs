@@ -22,6 +22,8 @@ const PRICE_DEVIATION_BPS: i128 = 5_000;
 const TVL_DRAIN_BPS: i128 = 2_000;
 /// 6-hour rolling window in seconds.
 const VELOCITY_WINDOW_SECS: u64 = 6 * 60 * 60;
+/// 48-hour oracle heartbeat interval.
+const ORACLE_HEARTBEAT_INTERVAL_SECS: u64 = 48 * 60 * 60;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -41,6 +43,12 @@ pub enum CircuitBreakerKey {
     VelocityAccumulator,
     /// Whether the contract is in SoftPause due to a velocity-limit breach.
     SoftPaused,
+    /// Last oracle heartbeat timestamp.
+    OracleLastHeartbeat,
+    /// Whether oracle is frozen due to no heartbeat.
+    OracleFrozenDueToNoHeartbeat,
+    /// Manual exchange rate set by DAO.
+    ManualExchangeRate,
 }
 
 // ── Oracle Price Guard (Issue #312) ───────────────────────────────────────────
@@ -51,6 +59,9 @@ pub enum CircuitBreakerKey {
 /// When the guard is tripped the caller should prevent any price-dependent
 /// operations until `confirm_oracle_price` is called by the sanity oracle.
 pub fn record_oracle_price(env: &Env, new_price: i128) -> bool {
+    // Ping the heartbeat on price update
+    ping_oracle_heartbeat(env);
+
     let last: i128 = env
         .storage()
         .instance()
@@ -110,6 +121,10 @@ pub fn is_oracle_frozen(env: &Env) -> bool {
     env.storage()
         .instance()
         .get(&CircuitBreakerKey::OracleFrozen)
+        .unwrap_or(false) ||
+    env.storage()
+        .instance()
+        .get(&CircuitBreakerKey::OracleFrozenDueToNoHeartbeat)
         .unwrap_or(false)
 }
 
@@ -119,6 +134,54 @@ pub fn set_sanity_oracle(env: &Env, sanity_oracle: &Address) {
     env.storage()
         .instance()
         .set(&CircuitBreakerKey::SanityOracle, sanity_oracle);
+}
+
+// ── Oracle Heartbeat and Manual Revert (Emergency Manual Revert for Oracle Freeze) ───────────────────────────────────────────
+
+/// Ping the oracle heartbeat, resetting the freeze if active.
+pub fn ping_oracle_heartbeat(env: &Env) {
+    let now = env.ledger().timestamp();
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::OracleLastHeartbeat, &now);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::OracleFrozenDueToNoHeartbeat, &false);
+}
+
+/// Check if oracle heartbeat is still valid. If not, freeze.
+pub fn check_oracle_heartbeat(env: &Env) -> bool {
+    let last: u64 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::OracleLastHeartbeat)
+        .unwrap_or(0);
+    let current = env.ledger().timestamp();
+    if current.saturating_sub(last) > ORACLE_HEARTBEAT_INTERVAL_SECS {
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::OracleFrozenDueToNoHeartbeat, &true);
+        false
+    } else {
+        true
+    }
+}
+
+/// Set manual exchange rate via DAO vote, clearing the freeze.
+pub fn set_manual_exchange_rate(env: &Env, rate: i128) {
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::ManualExchangeRate, &rate);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::OracleFrozenDueToNoHeartbeat, &false);
+}
+
+/// Get the manual exchange rate if set.
+pub fn get_manual_exchange_rate(env: &Env) -> Option<i128> {
+    env.storage()
+        .instance()
+        .get(&CircuitBreakerKey::ManualExchangeRate)
 }
 
 // ── TVL Velocity Limit (Issue #311) ───────────────────────────────────────────

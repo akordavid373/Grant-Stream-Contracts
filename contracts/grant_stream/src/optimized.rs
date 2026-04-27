@@ -71,6 +71,8 @@ pub enum Error {
     InvalidState = 8,
     MathOverflow = 9,
     InvalidStatusTransition = 10, // New error for invalid status transitions
+    SoftPaused = 11,
+    OracleFrozen = 12,
 }
 
 pub fn read_admin(env: &Env) -> Result<Address, Error> {

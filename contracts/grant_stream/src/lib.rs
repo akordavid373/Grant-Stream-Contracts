@@ -394,6 +394,11 @@ impl GrantStreamContract {
             return Err(Error::SoftPaused);
         }
 
+        // Emergency Manual Revert: reject withdrawals if oracle is frozen.
+        if circuit_breakers::is_oracle_frozen(&env) {
+            return Err(Error::OracleFrozen);
+        }
+
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
