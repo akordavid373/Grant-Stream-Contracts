@@ -76,6 +76,10 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
+pub mod flash_loan_defense;
+pub mod streaming_yield;
+pub mod protocol_succession;
+pub mod upgrade_manager;
 
 // --- Test Modules ---
 #[cfg(test)]
