@@ -1,4 +1,4 @@
-/// Circuit Breakers: Oracle Price Deviation Guard (#312) and TVL Velocity Limit (#311).
+/// Circuit Breakers: Oracle Price Deviation Guard (#312), TVL Velocity Limit (#311), and Storage Rent Depletion Warning.
 ///
 /// # Issue #312 — Oracle Price Deviation Guard
 /// If the XLM price reported by the oracle changes by more than 50% relative to
@@ -11,6 +11,11 @@
 /// window.  If cumulative withdrawals exceed 20% of the total protocol liquidity
 /// snapshot, the contract enters `SoftPause` mode.  An admin must explicitly call
 /// `resume_after_velocity_check` to resume normal operations.
+///
+/// # Storage Rent Depletion Warning
+/// Monitors the contract's native XLM balance to ensure sufficient funds for storage rent.
+/// If the balance falls below a 3-month rent buffer, non-essential functions are disabled
+/// to preserve funds for storage maintenance.
 
 use soroban_sdk::{contracttype, Address, Env};
 
@@ -24,6 +29,16 @@ const TVL_DRAIN_BPS: i128 = 2_000;
 const VELOCITY_WINDOW_SECS: u64 = 6 * 60 * 60;
 /// 48-hour oracle heartbeat interval.
 const ORACLE_HEARTBEAT_INTERVAL_SECS: u64 = 48 * 60 * 60;
+
+// ── Storage Rent Depletion Constants ───────────────────────────────────────
+
+/// Base rent reserve per month in XLM (1 XLM = 10^7 stroops).
+/// This is a conservative estimate based on typical contract storage usage.
+const MONTHLY_RENT_XLM: i128 = 1 * 10i128.pow(7); // 1 XLM per month
+/// 3-month rent buffer threshold.
+const RENT_BUFFER_MONTHS: u32 = 3;
+/// Total rent buffer for 3 months in XLM (stroops).
+const RENT_BUFFER_XLM: i128 = MONTHLY_RENT_XLM * RENT_BUFFER_MONTHS as i128; // 3 XLM
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -49,6 +64,12 @@ pub enum CircuitBreakerKey {
     OracleFrozenDueToNoHeartbeat,
     /// Manual exchange rate set by DAO.
     ManualExchangeRate,
+    /// Whether the contract is in rent preservation mode.
+    RentPreservationMode,
+    /// Last timestamp when rent balance was checked.
+    LastRentCheckTimestamp,
+    /// Warning threshold when rent preservation mode was engaged.
+    RentWarningThreshold,
 }
 
 // ── Oracle Price Guard (Issue #312) ───────────────────────────────────────────
@@ -278,4 +299,116 @@ pub fn resume_after_velocity_check(env: &Env, admin: &Address) {
     env.storage()
         .instance()
         .set(&CircuitBreakerKey::VelocityAccumulator, &0_i128);
+}
+
+// ── Storage Rent Depletion Warning ─────────────────────────────────────────────
+
+/// Check the contract's native XLM balance and enable rent preservation mode
+/// if it falls below the 3-month rent buffer.
+///
+/// Returns `true` if the balance is healthy, `false` if rent preservation mode was engaged.
+pub fn check_rent_balance(env: &Env) -> bool {
+    let now = env.ledger().timestamp();
+    
+    // Update last check timestamp
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::LastRentCheckTimestamp, &now);
+
+    // Get the contract's native XLM balance
+    let contract_address = env.current_contract_address();
+    let native_balance = env.account().get_balance(&contract_address);
+
+    // Check if balance is below rent buffer
+    if native_balance < RENT_BUFFER_XLM {
+        // Engage rent preservation mode
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::RentPreservationMode, &true);
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::RentWarningThreshold, &native_balance);
+        
+        // Log warning event
+        env.events().publish(
+            ("rent_warning", "low_balance"),
+            (native_balance, RENT_BUFFER_XLM, now),
+        );
+        
+        false
+    } else {
+        // Clear rent preservation mode if balance is healthy
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::RentPreservationMode, &false);
+        true
+    }
+}
+
+/// Returns `true` when the contract is in rent preservation mode.
+pub fn is_rent_preservation_mode(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&CircuitBreakerKey::RentPreservationMode)
+        .unwrap_or(false)
+}
+
+/// Get the current rent buffer threshold in stroops.
+pub fn get_rent_buffer_threshold(env: &Env) -> i128 {
+    RENT_BUFFER_XLM
+}
+
+/// Get the contract's current native XLM balance.
+pub fn get_current_xlm_balance(env: &Env) -> i128 {
+    let contract_address = env.current_contract_address();
+    env.account().get_balance(&contract_address)
+}
+
+/// Get the last rent check timestamp.
+pub fn get_last_rent_check_timestamp(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&CircuitBreakerKey::LastRentCheckTimestamp)
+}
+
+/// Get the warning threshold when rent preservation mode was engaged.
+pub fn get_rent_warning_threshold(env: &Env) -> Option<i128> {
+    env.storage()
+        .instance()
+        .get(&CircuitBreakerKey::RentWarningThreshold)
+}
+
+/// Admin-only: manually disable rent preservation mode after adding funds.
+/// This should only be called after sufficient XLM has been deposited to cover rent.
+pub fn disable_rent_preservation_mode(env: &Env, admin: &Address) {
+    admin.require_auth();
+    
+    // Verify that balance is now sufficient
+    let current_balance = get_current_xlm_balance(env);
+    if current_balance < RENT_BUFFER_XLM {
+        panic!("Insufficient balance to disable rent preservation mode");
+    }
+    
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::RentPreservationMode, &false);
+    
+    // Log recovery event
+    env.events().publish(
+        ("rent_recovery", "mode_disabled"),
+        (current_balance, RENT_BUFFER_XLM, env.ledger().timestamp()),
+    );
+}
+
+/// Check if a function should be allowed based on rent preservation mode.
+/// Essential functions (like depositing XLM) are always allowed.
+/// Non-essential functions are blocked during rent preservation mode.
+pub fn is_function_allowed(env: &Env, is_essential: bool) -> bool {
+    // Essential functions are always allowed
+    if is_essential {
+        return true;
+    }
+    
+    // Non-essential functions are blocked during rent preservation mode
+    !is_rent_preservation_mode(env)
 }
