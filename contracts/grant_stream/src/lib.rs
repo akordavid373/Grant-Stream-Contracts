@@ -28,6 +28,10 @@ pub mod yield_treasury;
 pub mod optimized;
 mod self_terminate;
 pub mod circuit_breakers;
+pub mod public_dashboard;
+pub mod tax_reporting;
+pub mod audit_log;
+pub mod multi_threshold;
 
 // --- Types ---
 
@@ -581,6 +585,12 @@ impl GrantStreamContract {
 
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
 
+        // Issue #323: record cumulative flow for tax-reporting export.
+        tax_reporting::record_flow(&env, &grant.recipient, grant.withdrawn);
+
+        // Issue #322: update Merkle audit leaf for this grant.
+        audit_log::update_audit_leaf(&env, grant_id, grant.withdrawn);
+
         Ok(())
     }
 
@@ -1128,6 +1138,110 @@ impl GrantStreamContract {
         );
 
         Ok(())
+    }
+
+    // ── Issue #324: Public-Dashboard Heartbeat ────────────────────────────────
+
+    /// Emit a treasury-health heartbeat event for community bots.
+    /// Fires when 24 h have elapsed or TVL changed by ≥5%.
+    /// Returns `true` when an event was emitted.
+    pub fn heartbeat_emit(
+        env: Env,
+        total_tvl: i128,
+        active_stream_count: u32,
+        disputed_amount: i128,
+        available_liquidity: i128,
+    ) -> bool {
+        public_dashboard::heartbeat_emit(
+            &env,
+            total_tvl,
+            active_stream_count,
+            disputed_amount,
+            available_liquidity,
+        )
+    }
+
+    // ── Issue #323: Tax-Reporting Export Hook ─────────────────────────────────
+
+    /// Return the time-weighted average flow for `recipient` over a ledger range.
+    /// Returns `(total_received, twa_per_second)`.
+    pub fn get_historical_flow(
+        env: Env,
+        recipient: Address,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> (i128, i128) {
+        tax_reporting::get_historical_flow(&env, &recipient, start_ts, end_ts)
+    }
+
+    // ── Issue #322: Audit-Log Merkle Root ─────────────────────────────────────
+
+    /// Return the last stored Merkle root (32 bytes) for off-chain indexers.
+    pub fn get_merkle_root(env: Env) -> soroban_sdk::Bytes {
+        audit_log::get_merkle_root(&env)
+    }
+
+    /// Return the rolling transaction counter used for Merkle root emission.
+    pub fn get_audit_tx_counter(env: Env) -> u32 {
+        audit_log::get_tx_counter(&env)
+    }
+
+    // ── Issue #321: Multi-Threshold Signature Logic ───────────────────────────
+
+    /// Register the signer set (must contain exactly 10 addresses).
+    /// Admin only.
+    pub fn initialize_rescue_signers(
+        env: Env,
+        signers: soroban_sdk::Vec<Address>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        multi_threshold::initialize_signers(&env, signers);
+        Ok(())
+    }
+
+    /// Open a new rescue proposal.  Caller must be a registered signer.
+    /// Returns the new proposal id.
+    pub fn propose_rescue(
+        env: Env,
+        proposer: Address,
+        kind: multi_threshold::RescueKind,
+        rescue_to: Address,
+        amount: i128,
+    ) -> u64 {
+        multi_threshold::propose_rescue(&env, proposer, kind, rescue_to, amount)
+    }
+
+    /// Add an approval to a pending rescue proposal.
+    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) {
+        multi_threshold::approve_rescue(&env, signer, proposal_id)
+    }
+
+    /// Execute a rescue proposal once the threshold is met.
+    /// Performs the actual token transfer.
+    pub fn execute_rescue(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+        token_address: Address,
+    ) -> Result<(), Error> {
+        let (rescue_to, amount) =
+            multi_threshold::execute_rescue(&env, caller, proposal_id);
+        let client = token::Client::new(&env, &token_address);
+        client.transfer(&env.current_contract_address(), &rescue_to, &amount);
+        Ok(())
+    }
+
+    /// Cancel a pending rescue proposal.  Only the original proposer may cancel.
+    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) {
+        multi_threshold::cancel_rescue(&env, proposer, proposal_id)
+    }
+
+    /// Return a rescue proposal by id.
+    pub fn get_rescue_proposal(
+        env: Env,
+        proposal_id: u64,
+    ) -> Option<multi_threshold::RescueProposal> {
+        multi_threshold::get_proposal(&env, proposal_id)
     }
 }
 
