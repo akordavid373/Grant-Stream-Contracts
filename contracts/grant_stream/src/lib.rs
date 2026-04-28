@@ -1369,6 +1369,46 @@ impl GrantStreamContract {
     ) -> Option<multi_threshold::RescueProposal> {
         multi_threshold::get_proposal(&env, proposal_id)
     }
+
+    /// Check if a user is an active grantee (has Active or Paused grants).
+    /// This is a zero-gas, read-only function for partner protocols to verify
+    /// grantee status for "Builder Discounts" or specialized access.
+    /// Returns true if the user has at least one active, uncompleted grant.
+    /// Returns false for stale/archived records or users with no active grants.
+    /// Optimized for high-frequency cross-contract queries.
+    pub fn is_active_grantee(env: Env, address: Address) -> bool {
+        // Get all grant IDs for this recipient
+        let recipient_key = DataKey::RecipientGrants(address);
+        if let Some(user_grants) = env.storage().instance().get::<_, Vec<u64>>(&recipient_key) {
+            // Early exit if no grants found
+            if user_grants.is_empty() {
+                return false;
+            }
+            
+            // Check each grant for active status
+            for i in 0..user_grants.len() {
+                let grant_id = user_grants.get(i).unwrap();
+                if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+                    // Only consider Active or Paused grants as "active grantees"
+                    // Completed, Cancelled, and RageQuitted are not active
+                    if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
+                        // Additional check: ensure grant is not fully depleted
+                        let total_withdrawn = grant.withdrawn
+                            .checked_add(grant.validator_withdrawn).unwrap_or(0);
+                        let total_claimable = grant.claimable
+                            .checked_add(grant.validator_claimable).unwrap_or(0);
+                        
+                        // Grant is active if there are remaining funds to be streamed
+                        if total_withdrawn < grant.total_amount || total_claimable > 0 {
+                            return true;
+                        }
+                    }
+                }
+                // If grant doesn't exist (archived/purged), continue checking others
+            }
+        }
+        false
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -1392,3 +1432,5 @@ mod test_temporal_fuzz;
 mod test_global_invariant_fuzz;
 #[cfg(test)]
 mod test_security_invariants;
+#[cfg(test)]
+mod is_active_grantee_benchmark;
