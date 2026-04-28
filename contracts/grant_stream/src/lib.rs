@@ -575,6 +575,11 @@ impl GrantStreamContract {
             return Err(Error::OracleFrozen);
         }
 
+        // Storage Rent Depletion: check rent balance and reject non-essential operations
+        if !circuit_breakers::is_function_allowed(&env, false) {
+            return Err(Error::RentPreservationMode);
+        }
+
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
@@ -593,6 +598,9 @@ impl GrantStreamContract {
 
         // Issue #311: record withdrawal velocity; may engage SoftPause.
         circuit_breakers::record_withdrawal_velocity(&env, amount);
+
+        // Storage Rent Depletion: check rent balance after withdrawal
+        circuit_breakers::check_rent_balance(&env);
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
@@ -829,6 +837,34 @@ impl GrantStreamContract {
         require_admin_auth(&env)?;
         if total_liquidity < 0 { return Err(Error::InvalidAmount); }
         circuit_breakers::update_tvl_snapshot(&env, total_liquidity);
+        Ok(())
+    }
+
+    /// Check the contract's rent balance and update rent preservation mode.  Admin only.
+    pub fn check_rent_balance(env: Env) -> Result<bool, Error> {
+        require_admin_auth(&env)?;
+        Ok(circuit_breakers::check_rent_balance(&env))
+    }
+
+    /// Get the current rent preservation mode status.
+    pub fn is_rent_preservation_mode(env: Env) -> bool {
+        circuit_breakers::is_rent_preservation_mode(&env)
+    }
+
+    /// Get the contract's current native XLM balance.
+    pub fn get_current_xlm_balance(env: Env) -> i128 {
+        circuit_breakers::get_current_xlm_balance(&env)
+    }
+
+    /// Get the rent buffer threshold (3-month buffer).
+    pub fn get_rent_buffer_threshold(env: Env) -> i128 {
+        circuit_breakers::get_rent_buffer_threshold(&env)
+    }
+
+    /// Admin-only: manually disable rent preservation mode after adding funds.
+    pub fn disable_rent_preservation_mode(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        circuit_breakers::disable_rent_preservation_mode(&env, &admin);
         Ok(())
     }
 

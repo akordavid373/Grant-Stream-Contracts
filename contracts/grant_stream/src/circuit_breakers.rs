@@ -1,4 +1,4 @@
-/// Circuit Breakers: Oracle Price Deviation Guard (#312) and TVL Velocity Limit (#311).
+/// Circuit Breakers: Oracle Price Deviation Guard (#312), TVL Velocity Limit (#311), and Storage Rent Depletion Warning.
 ///
 /// # Issue #312 — Oracle Price Deviation Guard
 /// If the XLM price reported by the oracle changes by more than 50% relative to
@@ -11,6 +11,11 @@
 /// window.  If cumulative withdrawals exceed 20% of the total protocol liquidity
 /// snapshot, the contract enters `SoftPause` mode.  An admin must explicitly call
 /// `resume_after_velocity_check` to resume normal operations.
+///
+/// # Storage Rent Depletion Warning
+/// Monitors the contract's native XLM balance to ensure sufficient funds for storage rent.
+/// If the balance falls below a 3-month rent buffer, non-essential functions are disabled
+/// to preserve funds for storage maintenance.
 
 use soroban_sdk::{contracttype, Address, Env};
 
@@ -28,6 +33,16 @@ const ORACLE_HEARTBEAT_INTERVAL_SECS: u64 = 48 * 60 * 60;
 const DISPUTE_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// 15% dispute threshold (in basis points: 1500 / 10000 = 15%).
 const DISPUTE_THRESHOLD_BPS: i128 = 1_500;
+
+// ── Storage Rent Depletion Constants ───────────────────────────────────────
+
+/// Base rent reserve per month in XLM (1 XLM = 10^7 stroops).
+/// This is a conservative estimate based on typical contract storage usage.
+const MONTHLY_RENT_XLM: i128 = 1 * 10i128.pow(7); // 1 XLM per month
+/// 3-month rent buffer threshold.
+const RENT_BUFFER_MONTHS: u32 = 3;
+/// Total rent buffer for 3 months in XLM (stroops).
+const RENT_BUFFER_XLM: i128 = MONTHLY_RENT_XLM * RENT_BUFFER_MONTHS as i128; // 3 XLM
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
