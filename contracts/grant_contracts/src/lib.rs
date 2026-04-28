@@ -136,11 +136,82 @@ pub fn get_next_grant_id(env: Env) -> u64 {
 
 #[contracttype]
 pub enum DataKey {
-    Grant(Symbol),
-    Milestone(Symbol, Symbol),
-    MilestoneVote(Symbol, Symbol, Address),
-    Withdrawn(Symbol, Address),
-    max_id + 1
+    // Basic grant data
+    Grant(u64),
+    GrantIds,
+    Admin,
+    
+    // Milestone data
+    MilestoneClaim(u64),
+    MilestoneChallenge(u64),
+    
+    // #417: Milestone-Reward-Clawback data
+    MilestoneClawbackRequest(u64),
+    MilestoneClawbackRequests(u64),
+    MilestoneClawbackIds,
+    ClawbackVotes(u64, Address),
+    NextMilestoneClawbackRequestId,
+    
+    // #419: Asset-Trustline-Check data
+    TrustlineCheckRecord(u64),
+    TrustlineCheckRecords(u64),
+    TrustlineCheckIds,
+    NextTrustlineCheckId,
+    
+    // Amendment system
+    GrantAmendment(u64),
+    AmendmentIds,
+    GrantAmendments(u64),
+    AmendmentAppeal(u64),
+    
+    // Financial snapshots
+    FinancialSnapshot(u64, u64),
+    SnapshotNonce(u64),
+    
+    // Slashing proposals
+    SlashingProposal(u64),
+    SlashingProposalIds,
+    GrantSlashingProposals(u64),
+    ProposalVotes(u64, Address),
+    NextProposalId,
+    VotingPower(Address),
+    TotalVotingPower,
+    
+    // Lease system
+    LeaseAgreement(u64),
+    PropertyRegistry(String),
+    
+    // Staged approvals
+    StagedApproval(u64),
+    StagedApprovals(u64),
+    StagedApprovalIds,
+    
+    // Emergency resumption
+    EmergencyResumption(u64),
+    
+    // Tax and jurisdiction
+    TaxWithholdingRecord(u64),
+    JurisdictionInfo(String),
+    GranteeRecord(Address),
+    
+    // Proposal staking
+    ProposalStake(u64, Address),
+    
+    // Cross-chain metadata
+    CrossChainMetadata(u64),
+    
+    // WASM hash verification
+    WasmHashVerification(u64),
+    
+    // User tracking
+    RecipientGrants(Address),
+    GrantDonors(u64),
+    DonorRecord(u64, Address),
+    
+    // Partial cancellation
+    PartialCancellation(u64),
+    PartialCancellationIds,
+    GrantPartialCancellations(u64),
 }
 
 /// Admin authentication helper
@@ -1106,103 +1177,6 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::TrustlineNotEstablished => soroban_sdk::Error::from_contract_error(23),
             GrantError::TrustlineVerificationFailed => soroban_sdk::Error::from_contract_error(24),
             GrantError::AssetAddressInvalid => soroban_sdk::Error::from_contract_error(25),
-enum DataKey {
-    Admin,
-    GrantToken,
-    GrantIds,
-    Treasury,
-    Oracle,
-    NativeToken,
-    Grant(u64),
-    RecipientGrants(Address),
-    // Lease-related keys
-    LeaseAgreement(u64), // Maps grant_id to lease agreement details
-    PropertyRegistry(String), // Maps property_id to lease history
-    // Financial snapshot keys
-    FinancialSnapshot(u64, u64), // Maps grant_id + timestamp to snapshot
-    SnapshotNonce(u64), // Maps grant_id to nonce for snapshot generation
-    // Slashing proposal keys
-    SlashingProposal(u64), // Maps proposal_id to proposal details
-    SlashingProposalIds, // List of all slashing proposal IDs
-    GrantSlashingProposals(u64), // Maps grant_id to list of slashing proposal IDs
-    VotingPower(Address), // Maps voter address to their voting power
-    ProposalVotes(u64, Address), // Maps proposal_id + voter to their vote
-    NextProposalId, // Next available proposal ID
-    TotalVotingPower, // Total voting power in the system
-    MaxFlowRate(u64),
-    PriorityMultipliers,
-    PlatformFeeBps,
-    // Sub-DAO Authority integration
-    SubDaoAuthorityContract, // Address of Sub-DAO authority contract
-    // COI (Conflict of Interest) keys
-    LinkedAddresses(u64), // Maps grant_id to linked addresses
-    VoterExclusions(u64), // Maps proposal_id to excluded voters with reasons
-    // Milestone system keys
-    MilestoneClaim(u64), // Maps claim_id to milestone claim details
-    MilestoneChallenge(u64), // Maps challenge_id to challenge details
-    GrantMilestones(u64), // Maps grant_id to list of milestone claim IDs
-    NextMilestoneClaimId, // Next available milestone claim ID
-    NextChallengeId, // Next available challenge ID
-    // Proposal Staking Escrow keys
-    ProposalStake(u64), // Maps grant_id to staking escrow details
-    StakeEscrowBalance, // Total balance of all staked proposals
-    BurnedStakes, // Track total burned stakes for transparency
-    // Grant Registry keys for on-chain indexing
-    GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
-    // Tax Jurisdiction keys
-    JurisdictionRegistry(String), // Maps jurisdiction code to tax rate
-    JurisdictionCodes,           // List of all jurisdiction codes
-    GranteeJurisdiction(Address), // Maps grantee address to jurisdiction code
-    TaxWithholdingReserve,       // Reserve for tax withholding funds
-    JurisdictionRegistryContract, // Address of jurisdiction registry contract
-    TaxWithholdingRecord(u64, u64), // Maps grant_id + payment_id to tax record
-    NextTaxRecordId,             // Next available tax record ID
-    // Grant Amendment Challenge Period keys
-    GrantAmendment(u64),         // Maps amendment_id to amendment details
-    GrantAmendments(u64),        // Maps grant_id to list of amendment IDs
-    NextAmendmentId,             // Next available amendment ID
-    AmendmentIds,                // List of all amendment IDs
-    AmendmentAppeal(u64),         // Maps appeal_id to appeal details
-    NextAppealId,                // Next available appeal ID
-    
-    // #415: Authorized Grantee Change keys
-    GranteeChangeRequest(u64),   // Maps request_id to grantee change request
-    GranteeChangeRequests(u64),  // Maps grant_id to list of change request IDs
-    NextGranteeChangeRequestId,  // Next available grantee change request ID
-    GranteeChangeIds,            // List of all grantee change request IDs
-    
-    // #416: Emergency Grace Period keys
-    EmergencyResumptionRequest(u64), // Maps request_id to emergency resumption request
-    EmergencyResumptionRequests(u64), // Maps grant_id to list of emergency resumption request IDs
-    NextEmergencyResumptionRequestId, // Next available emergency resumption request ID
-    EmergencyResumptionIds,      // List of all emergency resumption request IDs
-    
-    // #414: Staged Approval Workflow keys
-    StagedApproval(u64),         // Maps approval_id to staged approval details
-    StagedApprovals(u64),        // Maps grant_id to list of staged approval IDs
-    NextStagedApprovalId,        // Next available staged approval ID
-    StagedApprovalIds,           // List of all staged approval IDs
-    
-    // #408: Partial Funding Cancellation keys
-    PartialCancellationRequest(u64), // Maps request_id to partial cancellation request
-    PartialCancellationRequests(u64), // Maps grant_id to list of partial cancellation request IDs
-    NextPartialCancellationRequestId, // Next available partial cancellation request ID
-    PartialCancellationIds,       // List of all partial cancellation request IDs
-
-    // #417: Milestone-Reward-Clawback keys
-    MilestoneClawbackRequest(u64), // Maps clawback_id to clawback request details
-    MilestoneClawbackRequests(u64), // Maps grant_id to list of clawback request IDs
-    NextMilestoneClawbackRequestId, // Next available clawback request ID
-    MilestoneClawbackIds,          // List of all clawback request IDs
-    ClawbackVotes(u64, Address),   // Maps clawback_id + voter to their vote
-    
-    // #419: Asset-Trustline-Check keys
-    TrustlineCheckRecord(u64),     // Maps check_id to trustline check record
-    TrustlineCheckRecords(u64),    // Maps grant_id to list of trustline check IDs
-    NextTrustlineCheckId,          // Next available trustline check ID
-    TrustlineCheckIds,             // List of all trustline check IDs
-
-}
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -1341,6 +1315,21 @@ pub enum Error {
     PartialCancellationChallengeActive = 119,
     PartialCancellationNotApproved = 120,
     InvalidPartialCancellationAmount = 121,
+    
+    // #417: Milestone-Reward-Clawback errors
+    ClawbackRequestNotFound = 122,
+    ClawbackAlreadyExecuted = 123,
+    ClawbackVotingExpired = 124,
+    ClawbackNotApproved = 125,
+    InvalidClawbackAmount = 126,
+    ClawbackChallengePeriodActive = 127,
+    
+    // #419: Asset-Trustline-Check errors
+    TrustlineCheckNotFound = 128,
+    TrustlineCheckExpired = 129,
+    TrustlineNotEstablished = 130,
+    TrustlineVerificationFailed = 131,
+    AssetAddressInvalid = 132,
 
 }
 
@@ -3369,6 +3358,55 @@ impl GrantContract {
         reason: Option<String>,
     ) -> Result<(), Error> {
         crate::grant_contracts::approve_partial_cancellation(env, request_id, approved, reason)
+    }
+
+    // --- #417: Milestone-Reward-Clawback Functions ---
+    
+    /// Propose a milestone clawback request for post-payout fraud detection
+    pub fn propose_milestone_clawback(
+        env: Env,
+        grant_id: u64,
+        milestone_claim_id: u64,
+        amount: i128,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        crate::grant_contracts::propose_milestone_clawback(env, grant_id, milestone_claim_id, amount, reason, evidence)
+    }
+
+    /// Vote on a milestone clawback request
+    pub fn vote_milestone_clawback(
+        env: Env,
+        clawback_id: u64,
+        vote_for: bool,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::vote_milestone_clawback(env, clawback_id, vote_for)
+    }
+
+    // --- #419: Asset-Trustline-Check Functions ---
+    
+    /// Check if grantee has established trustline for the grant asset before stream start
+    pub fn check_grantee_trustline(
+        env: Env,
+        grant_id: u64,
+    ) -> Result<u64, Error> {
+        crate::grant_contracts::check_grantee_trustline(env, grant_id)
+    }
+
+    /// Re-check a failed trustline check to see if it has been resolved
+    pub fn recheck_trustline(
+        env: Env,
+        check_id: u64,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::recheck_trustline(env, check_id)
+    }
+
+    /// Get trustline check status
+    pub fn get_trustline_check_status(
+        env: Env,
+        check_id: u64,
+    ) -> Result<TrustlineCheckRecord, Error> {
+        crate::grant_contracts::get_trustline_check_status(env, check_id)
     }
 }
 
