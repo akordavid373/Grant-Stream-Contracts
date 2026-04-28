@@ -34,7 +34,7 @@ pub mod audit_log;
 pub mod multi_threshold;
 
 #[cfg(test)]
-mod test_rent_circuit_breaker;
+mod test_dispute_circuit_breaker;
 
 // --- Types ---
 
@@ -151,7 +151,7 @@ pub enum Error {
     GrantNotPurgeable = 16,
     OraclePriceFrozen = 17,
     SoftPaused = 18,
-    RentPreservationMode = 19,
+    GrantInitializationHalted = 19,
 }
 
 // --- Internal Helpers ---
@@ -212,6 +212,20 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
         }
     }
     Ok(total)
+}
+
+fn count_active_grants(env: &Env) -> u32 {
+    let mut count = 0_u32;
+    let ids = read_grant_ids(env);
+    for i in 0..ids.len() {
+        let grant_id = ids.get(i).unwrap();
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+            if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
 }
 
 fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
@@ -483,9 +497,9 @@ impl GrantStreamContract {
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
-        // Storage Rent Depletion: check rent balance and reject non-essential operations
-        if !circuit_breakers::is_function_allowed(&env, false) {
-            return Err(Error::RentPreservationMode);
+        // Mass dispute trigger: check if grant initialization is halted
+        if circuit_breakers::is_grant_initialization_halted(&env) {
+            return Err(Error::GrantInitializationHalted);
         }
 
         if total_amount <= 0 || flow_rate < 0 {
@@ -920,6 +934,46 @@ impl GrantStreamContract {
         };
         
         vested.min(total)
+    }
+
+    /// Trigger dispute monitoring for a grant. This should be called when a grant
+    /// enters "Dispute" status through the arbitration process.
+    pub fn trigger_grant_dispute(env: Env, grant_id: u64) -> Result<(), Error> {
+        // Verify the grant exists and is in a state that can be disputed
+        let _grant = read_grant(&env, grant_id)?;
+        
+        // Count current active grants for the dispute monitoring calculation
+        let active_grants_count = count_active_grants(&env);
+        
+        // Record the dispute and check if threshold is breached
+        if !circuit_breakers::record_dispute(&env, active_grants_count) {
+            // Threshold was breached - emit an event for transparency
+            let admin = read_admin(&env)?;
+            env.events().publish(
+                (symbol_short!("dispute_cb"),),
+                (grant_id, active_grants_count, "Mass dispute threshold breached"),
+            );
+        }
+        
+        Ok(())
+    }
+
+    /// Get current dispute monitoring statistics for transparency.
+    pub fn get_dispute_stats(env: Env) -> (u64, u32, u32, bool) {
+        circuit_breakers::get_dispute_monitoring_stats(&env)
+    }
+
+    /// Admin-only: resume grant initialization after manual verification of dispute activity.
+    pub fn resume_grant_initialization(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        circuit_breakers::resume_grant_initialization(&env, &admin);
+        
+        env.events().publish(
+            (symbol_short!("resume_grants"),),
+            admin,
+        );
+        
+        Ok(())
     }
 
     /// Compute the claimable balance for logarithmic vesting.

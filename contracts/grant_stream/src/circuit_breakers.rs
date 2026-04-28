@@ -29,6 +29,10 @@ const TVL_DRAIN_BPS: i128 = 2_000;
 const VELOCITY_WINDOW_SECS: u64 = 6 * 60 * 60;
 /// 48-hour oracle heartbeat interval.
 const ORACLE_HEARTBEAT_INTERVAL_SECS: u64 = 48 * 60 * 60;
+/// 24-hour dispute monitoring window.
+const DISPUTE_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// 15% dispute threshold (in basis points: 1500 / 10000 = 15%).
+const DISPUTE_THRESHOLD_BPS: i128 = 1_500;
 
 // ── Storage Rent Depletion Constants ───────────────────────────────────────
 
@@ -64,12 +68,14 @@ pub enum CircuitBreakerKey {
     OracleFrozenDueToNoHeartbeat,
     /// Manual exchange rate set by DAO.
     ManualExchangeRate,
-    /// Whether the contract is in rent preservation mode.
-    RentPreservationMode,
-    /// Last timestamp when rent balance was checked.
-    LastRentCheckTimestamp,
-    /// Warning threshold when rent preservation mode was engaged.
-    RentWarningThreshold,
+    /// Timestamp when the current dispute monitoring window started (u64).
+    DisputeWindowStart,
+    /// Number of disputes in the current 24-hour window (u32).
+    DisputeAccumulator,
+    /// Number of active grants at window start (u32).
+    ActiveGrantsSnapshot,
+    /// Whether new grant initialization is halted due to mass dispute trigger.
+    GrantInitializationHalted,
 }
 
 // ── Oracle Price Guard (Issue #312) ───────────────────────────────────────────
@@ -301,114 +307,122 @@ pub fn resume_after_velocity_check(env: &Env, admin: &Address) {
         .set(&CircuitBreakerKey::VelocityAccumulator, &0_i128);
 }
 
-// ── Storage Rent Depletion Warning ─────────────────────────────────────────────
+// ── Mass Milestone Dispute Trigger (Sybil-Dispute Attack Protection) ─────────
 
-/// Check the contract's native XLM balance and enable rent preservation mode
-/// if it falls below the 3-month rent buffer.
+/// Record a new dispute and check whether the mass dispute threshold has been breached.
 ///
-/// Returns `true` if the balance is healthy, `false` if rent preservation mode was engaged.
-pub fn check_rent_balance(env: &Env) -> bool {
-    let now = env.ledger().timestamp();
-    
-    // Update last check timestamp
+/// Returns `true` if the dispute is recorded normally, `false` if the threshold
+/// was just breached and grant initialization has been halted.
+///
+/// This function should be called whenever a grant is placed into "Dispute" status.
+pub fn record_dispute(env: &Env, active_grants_count: u32) -> bool {
+    let now: u64 = env.ledger().timestamp();
+    let window_start: u64 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeWindowStart)
+        .unwrap_or(now);
+    let mut accumulator: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeAccumulator)
+        .unwrap_or(0);
+
+    // Reset window if it has expired (24 hours).
+    if now.saturating_sub(window_start) >= DISPUTE_WINDOW_SECS {
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::DisputeWindowStart, &now);
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::ActiveGrantsSnapshot, &active_grants_count);
+        accumulator = 0;
+    }
+
+    // Update the active grants snapshot if this is the first dispute in the window
+    if accumulator == 0 {
+        env.storage()
+            .instance()
+            .set(&CircuitBreakerKey::ActiveGrantsSnapshot, &active_grants_count);
+    }
+
+    accumulator = accumulator.saturating_add(1);
     env.storage()
         .instance()
-        .set(&CircuitBreakerKey::LastRentCheckTimestamp, &now);
+        .set(&CircuitBreakerKey::DisputeAccumulator, &accumulator);
 
-    // Get the contract's native XLM balance
-    let contract_address = env.current_contract_address();
-    let native_balance = env.account().get_balance(&contract_address);
+    // Check if disputes exceed 15% of active grants
+    let snapshot_grants: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::ActiveGrantsSnapshot)
+        .unwrap_or(active_grants_count);
 
-    // Check if balance is below rent buffer
-    if native_balance < RENT_BUFFER_XLM {
-        // Engage rent preservation mode
-        env.storage()
-            .instance()
-            .set(&CircuitBreakerKey::RentPreservationMode, &true);
-        env.storage()
-            .instance()
-            .set(&CircuitBreakerKey::RentWarningThreshold, &native_balance);
-        
-        // Log warning event
-        env.events().publish(
-            ("rent_warning", "low_balance"),
-            (native_balance, RENT_BUFFER_XLM, now),
-        );
-        
-        false
-    } else {
-        // Clear rent preservation mode if balance is healthy
-        env.storage()
-            .instance()
-            .set(&CircuitBreakerKey::RentPreservationMode, &false);
-        true
+    if snapshot_grants > 0 {
+        let dispute_percentage_bps = (accumulator as i128)
+            .saturating_mul(10_000)
+            .checked_div(snapshot_grants as i128)
+            .unwrap_or(i128::MAX);
+
+        if dispute_percentage_bps >= DISPUTE_THRESHOLD_BPS {
+            // Trip the circuit breaker - halt new grant initializations
+            env.storage()
+                .instance()
+                .set(&CircuitBreakerKey::GrantInitializationHalted, &true);
+            return false; // threshold breached; grant initialization halted
+        }
     }
+
+    true
 }
 
-/// Returns `true` when the contract is in rent preservation mode.
-pub fn is_rent_preservation_mode(env: &Env) -> bool {
+/// Returns `true` when new grant initialization is halted due to mass dispute trigger.
+pub fn is_grant_initialization_halted(env: &Env) -> bool {
     env.storage()
         .instance()
-        .get(&CircuitBreakerKey::RentPreservationMode)
+        .get(&CircuitBreakerKey::GrantInitializationHalted)
         .unwrap_or(false)
 }
 
-/// Get the current rent buffer threshold in stroops.
-pub fn get_rent_buffer_threshold(env: &Env) -> i128 {
-    RENT_BUFFER_XLM
-}
-
-/// Get the contract's current native XLM balance.
-pub fn get_current_xlm_balance(env: &Env) -> i128 {
-    let contract_address = env.current_contract_address();
-    env.account().get_balance(&contract_address)
-}
-
-/// Get the last rent check timestamp.
-pub fn get_last_rent_check_timestamp(env: &Env) -> Option<u64> {
-    env.storage()
-        .instance()
-        .get(&CircuitBreakerKey::LastRentCheckTimestamp)
-}
-
-/// Get the warning threshold when rent preservation mode was engaged.
-pub fn get_rent_warning_threshold(env: &Env) -> Option<i128> {
-    env.storage()
-        .instance()
-        .get(&CircuitBreakerKey::RentWarningThreshold)
-}
-
-/// Admin-only: manually disable rent preservation mode after adding funds.
-/// This should only be called after sufficient XLM has been deposited to cover rent.
-pub fn disable_rent_preservation_mode(env: &Env, admin: &Address) {
+/// Admin-only: resume grant initialization after manual verification of dispute activity.
+/// This should only be called after the admin has investigated the dispute pattern
+/// and determined it was not a coordinated Sybil attack.
+pub fn resume_grant_initialization(env: &Env, admin: &Address) {
     admin.require_auth();
-    
-    // Verify that balance is now sufficient
-    let current_balance = get_current_xlm_balance(env);
-    if current_balance < RENT_BUFFER_XLM {
-        panic!("Insufficient balance to disable rent preservation mode");
-    }
-    
     env.storage()
         .instance()
-        .set(&CircuitBreakerKey::RentPreservationMode, &false);
-    
-    // Log recovery event
-    env.events().publish(
-        ("rent_recovery", "mode_disabled"),
-        (current_balance, RENT_BUFFER_XLM, env.ledger().timestamp()),
-    );
+        .set(&CircuitBreakerKey::GrantInitializationHalted, &false);
+    // Reset the dispute window so the 24-hour clock starts fresh.
+    let now: u64 = env.ledger().timestamp();
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::DisputeWindowStart, &now);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::DisputeAccumulator, &0_u32);
+    env.storage()
+        .instance()
+        .set(&CircuitBreakerKey::ActiveGrantsSnapshot, &0_u32);
 }
 
-/// Check if a function should be allowed based on rent preservation mode.
-/// Essential functions (like depositing XLM) are always allowed.
-/// Non-essential functions are blocked during rent preservation mode.
-pub fn is_function_allowed(env: &Env, is_essential: bool) -> bool {
-    // Essential functions are always allowed
-    if is_essential {
-        return true;
-    }
-    
-    // Non-essential functions are blocked during rent preservation mode
-    !is_rent_preservation_mode(env)
+/// Get current dispute monitoring statistics for transparency.
+pub fn get_dispute_monitoring_stats(env: &Env) -> (u64, u32, u32, bool) {
+    let window_start: u64 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeWindowStart)
+        .unwrap_or(0);
+    let dispute_count: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::DisputeAccumulator)
+        .unwrap_or(0);
+    let active_grants_snapshot: u32 = env
+        .storage()
+        .instance()
+        .get(&CircuitBreakerKey::ActiveGrantsSnapshot)
+        .unwrap_or(0);
+    let halted: bool = is_grant_initialization_halted(env);
+
+    (window_start, dispute_count, active_grants_snapshot, halted)
 }
