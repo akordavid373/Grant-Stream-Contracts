@@ -90,6 +90,8 @@ pub struct Grant {
     pub requires_legal_signature: bool,
     /// Boolean flag indicating if the legal document has been signed by the grantee.
     pub is_legal_signed: bool,
+    /// Optional reason string for why the grant was paused
+    pub pause_reason: Option<String>,
 }
 
 
@@ -519,6 +521,7 @@ impl GrantStreamContract {
             legal_hash: None,
             requires_legal_signature: false,
             is_legal_signed: false,
+            pause_reason: None,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -610,14 +613,23 @@ impl GrantStreamContract {
         Ok(())
     }
 
-    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
+    pub fn pause_stream(env: Env, grant_id: u64, reason: Option<String>) -> Result<(), Error> {
         require_admin_auth(&env)?;
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
         settle_grant(&mut grant, env.ledger().timestamp())?;
         grant.status = GrantStatus::Paused;
+        grant.pause_reason = reason.clone();
         write_grant(&env, grant_id, &grant);
+        
+        // Emit ProtocolPaused event with reason
+        let admin = read_admin(&env)?;
+        let pause_reason_str = reason.unwrap_or_else(|| String::from_str(&env, "No reason provided"));
+        env.events().publish(
+            (symbol_short!("protocol_paused"), admin, grant_id),
+            pause_reason_str,
+        );
         Ok(())
     }
 
@@ -628,8 +640,38 @@ impl GrantStreamContract {
 
         grant.status = GrantStatus::Active;
         grant.last_update_ts = env.ledger().timestamp();
+        grant.pause_reason = None; // Clear pause reason on resume
         write_grant(&env, grant_id, &grant);
         Ok(())
+    }
+
+    /// Emergency pause function for protocol-wide emergency stops
+    /// Stores the reason in contract state and emits ProtocolPaused event
+    pub fn emergency_pause(env: Env, reason: String) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        // Store the emergency pause reason in contract state
+        env.storage().instance().set(&DataKey::ProtocolPauseReason, &reason);
+        
+        // Emit ProtocolPaused event for protocol-wide emergency pause
+        let admin = read_admin(&env)?;
+        env.events().publish(
+            (symbol_short!("protocol_paused"), admin, "EMERGENCY"),
+            reason,
+        );
+        
+        Ok(())
+    }
+
+    /// Get the pause reason for a specific grant
+    pub fn get_pause_reason(env: Env, grant_id: u64) -> Result<Option<String>, Error> {
+        let grant = read_grant(&env, grant_id)?;
+        Ok(grant.pause_reason)
+    }
+
+    /// Get the protocol-wide emergency pause reason
+    pub fn get_protocol_pause_reason(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ProtocolPauseReason)
     }
 
     pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
