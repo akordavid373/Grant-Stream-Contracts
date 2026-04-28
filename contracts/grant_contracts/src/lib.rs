@@ -85,6 +85,17 @@ const MIN_GRANTOR_SHARE_PERCENTAGE: u32 = 1000; // 10% minimum share for partial
 const MAX_GRANTORS_FOR_PARTIAL_CANCELLATION: u32 = 10; // Maximum number of grantors supported
 const PARTIAL_CANCELLATION_CHALLENGE_PERIOD: u64 = 5 * 24 * 60 * 60; // 5 days challenge period
 
+// #417: Milestone-Reward-Clawback constants
+const MILESTONE_CLAWBACK_CHALLENGE_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days challenge period for clawback
+const MAX_CLAWBACK_REASON_LENGTH: u32 = 1000; // Maximum clawback reason length
+const MAX_CLAWBACK_EVIDENCE_LENGTH: u32 = 2000; // Maximum clawback evidence length
+const CLAWBACK_VOTING_THRESHOLD: u32 = 6600; // 66% approval required for clawback (basis points)
+const MIN_CLAWBACK_VOTING_PARTICIPATION: u32 = 5000; // 50% minimum participation for clawback (basis points)
+
+// #419: Asset-Trustline-Check constants
+const TRUSTLINE_CHECK_TIMEOUT: u64 = 7 * 24 * 60 * 60; // 7 days timeout for trustline establishment
+const MAX_TRUSTLINE_REASON_LENGTH: u32 = 500; // Maximum reason length for trustline failures
+
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -976,6 +987,63 @@ pub enum PartialCancellationStatus {
     Cancelled,       // Request cancelled
 }
 
+// #417: Milestone-Reward-Clawback Types
+#[derive(Clone)]
+#[contracttype]
+pub struct MilestoneClawbackRequest {
+    pub clawback_id: u64,
+    pub grant_id: u64,
+    pub milestone_claim_id: u64,
+    pub clawbacker: Address,
+    pub grantee: Address,
+    pub amount: i128,
+    pub reason: String,
+    pub evidence: String,
+    pub created_at: u64,
+    pub challenge_deadline: u64,
+    pub status: ClawbackStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub total_voting_power: i128,
+    pub executed_at: Option<u64>,
+    pub clawback_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ClawbackStatus {
+    Proposed,        // Clawback proposed, voting period open
+    Approved,        // Clawback approved, ready for execution
+    Rejected,        // Clawback rejected by vote
+    Executed,        // Clawback successfully executed
+    Expired,         // Voting period expired
+    Cancelled,       // Request cancelled by proposer
+}
+
+// #419: Asset-Trustline-Check Types
+#[derive(Clone)]
+#[contracttype]
+pub struct TrustlineCheckRecord {
+    pub check_id: u64,
+    pub grant_id: u64,
+    pub grantee: Address,
+    pub asset_address: Address,
+    pub checked_at: u64,
+    pub status: TrustlineStatus,
+    pub failure_reason: Option<String>,
+    pub resolved_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum TrustlineStatus {
+    Pending,         // Trustline check pending
+    Verified,        // Trustline verified and active
+    Failed,          // Trustline check failed
+    Resolved,        // Trustline issue resolved
+    Expired,         // Check timeout expired
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum GrantError {
@@ -993,6 +1061,19 @@ pub enum GrantError {
     InvalidGrantee,
     InvalidStreamConfig,
     InvalidAccelerationConfig,
+    // #417: Milestone-Reward-Clawback errors
+    ClawbackRequestNotFound,
+    ClawbackAlreadyExecuted,
+    ClawbackVotingExpired,
+    ClawbackNotApproved,
+    InvalidClawbackAmount,
+    ClawbackChallengePeriodActive,
+    // #419: Asset-Trustline-Check errors
+    TrustlineCheckNotFound,
+    TrustlineCheckExpired,
+    TrustlineNotEstablished,
+    TrustlineVerificationFailed,
+    AssetAddressInvalid,
 }
 
 impl From<GrantError> for soroban_sdk::Error {
@@ -1012,6 +1093,19 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
             GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
             GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
+            // #417: Milestone-Reward-Clawback errors
+            GrantError::ClawbackRequestNotFound => soroban_sdk::Error::from_contract_error(15),
+            GrantError::ClawbackAlreadyExecuted => soroban_sdk::Error::from_contract_error(16),
+            GrantError::ClawbackVotingExpired => soroban_sdk::Error::from_contract_error(17),
+            GrantError::ClawbackNotApproved => soroban_sdk::Error::from_contract_error(18),
+            GrantError::InvalidClawbackAmount => soroban_sdk::Error::from_contract_error(19),
+            GrantError::ClawbackChallengePeriodActive => soroban_sdk::Error::from_contract_error(20),
+            // #419: Asset-Trustline-Check errors
+            GrantError::TrustlineCheckNotFound => soroban_sdk::Error::from_contract_error(21),
+            GrantError::TrustlineCheckExpired => soroban_sdk::Error::from_contract_error(22),
+            GrantError::TrustlineNotEstablished => soroban_sdk::Error::from_contract_error(23),
+            GrantError::TrustlineVerificationFailed => soroban_sdk::Error::from_contract_error(24),
+            GrantError::AssetAddressInvalid => soroban_sdk::Error::from_contract_error(25),
 enum DataKey {
     Admin,
     GrantToken,
@@ -1094,6 +1188,19 @@ enum DataKey {
     PartialCancellationRequests(u64), // Maps grant_id to list of partial cancellation request IDs
     NextPartialCancellationRequestId, // Next available partial cancellation request ID
     PartialCancellationIds,       // List of all partial cancellation request IDs
+
+    // #417: Milestone-Reward-Clawback keys
+    MilestoneClawbackRequest(u64), // Maps clawback_id to clawback request details
+    MilestoneClawbackRequests(u64), // Maps grant_id to list of clawback request IDs
+    NextMilestoneClawbackRequestId, // Next available clawback request ID
+    MilestoneClawbackIds,          // List of all clawback request IDs
+    ClawbackVotes(u64, Address),   // Maps clawback_id + voter to their vote
+    
+    // #419: Asset-Trustline-Check keys
+    TrustlineCheckRecord(u64),     // Maps check_id to trustline check record
+    TrustlineCheckRecords(u64),    // Maps grant_id to list of trustline check IDs
+    NextTrustlineCheckId,          // Next available trustline check ID
+    TrustlineCheckIds,             // List of all trustline check IDs
 
 }
 
@@ -3059,6 +3166,48 @@ impl GrantContract {
 
     pub fn get_property_history(env: Env, property_id: String) -> Vec<(u64, Address, u64)> {
         read_property_history(&env, &property_id)
+    }
+
+    // #417: Milestone-Reward-Clawback Functions
+    pub fn propose_milestone_clawback(
+        env: Env,
+        grant_id: u64,
+        milestone_claim_id: u64,
+        amount: i128,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        propose_milestone_clawback(env, grant_id, milestone_claim_id, amount, reason, evidence)
+    }
+
+    pub fn vote_milestone_clawback(
+        env: Env,
+        clawback_id: u64,
+        vote_for: bool,
+    ) -> Result<(), Error> {
+        vote_milestone_clawback(env, clawback_id, vote_for)
+    }
+
+    // #419: Asset-Trustline-Check Functions
+    pub fn check_grantee_trustline(
+        env: Env,
+        grant_id: u64,
+    ) -> Result<u64, Error> {
+        check_grantee_trustline(env, grant_id)
+    }
+
+    pub fn recheck_trustline(
+        env: Env,
+        check_id: u64,
+    ) -> Result<(), Error> {
+        recheck_trustline(env, check_id)
+    }
+
+    pub fn get_trustline_check_status(
+        env: Env,
+        check_id: u64,
+    ) -> Result<TrustlineCheckRecord, Error> {
+        get_trustline_check_status(env, check_id)
     }
 
     // Financial Snapshot Functions
@@ -5998,6 +6147,364 @@ fn get_next_partial_cancellation_request_id(env: &Env) -> u64 {
     env.ledger().sequence + 3000000
 }
 
+// #417: Milestone-Reward-Clawback Implementation
+
+/// Propose a milestone clawback request for post-payout fraud detection
+/// 
+/// This function allows any stakeholder to propose clawing back milestone rewards
+/// if fraud is detected after payout. It initiates a voting process.
+pub fn propose_milestone_clawback(
+    env: Env,
+    grant_id: u64,
+    milestone_claim_id: u64,
+    amount: i128,
+    reason: String,
+    evidence: String,
+) -> Result<u64, Error> {
+    // Validate inputs
+    if amount <= 0 {
+        return Err(Error::InvalidAmount);
+    }
+    
+    if reason.len() > MAX_CLAWBACK_REASON_LENGTH as usize {
+        return Err(Error::InvalidAmount);
+    }
+    
+    if evidence.len() > MAX_CLAWBACK_EVIDENCE_LENGTH as usize {
+        return Err(Error::InvalidAmount);
+    }
+    
+    // Verify milestone claim exists and was paid
+    let claim: MilestoneClaim = env.storage().instance()
+        .get(&DataKey::MilestoneClaim(milestone_claim_id))
+        .ok_or(Error::MilestoneNotFound)?;
+    
+    if claim.status != MilestoneStatus::Paid {
+        return Err(Error::InvalidStatus);
+    }
+    
+    if claim.grant_id != grant_id {
+        return Err(Error::GrantNotFound);
+    }
+    
+    // Get grant details
+    let grant: Grant = env.storage().instance()
+        .get(&DataKey::Grant(grant_id))
+        .ok_or(Error::GrantNotFound)?;
+    
+    // Verify clawback amount doesn't exceed the milestone amount
+    if amount > claim.amount {
+        return Err(Error::InvalidClawbackAmount);
+    }
+    
+    // Create clawback request
+    let clawback_id = get_next_milestone_clawback_request_id(&env);
+    let now = env.ledger().timestamp();
+    
+    let clawback_request = MilestoneClawbackRequest {
+        clawback_id,
+        grant_id,
+        milestone_claim_id,
+        clawbacker: env.invoker(),
+        grantee: claim.claimer,
+        amount,
+        reason,
+        evidence,
+        created_at: now,
+        challenge_deadline: now + MILESTONE_CLAWBACK_CHALLENGE_PERIOD,
+        status: ClawbackStatus::Proposed,
+        votes_for: 0,
+        votes_against: 0,
+        total_voting_power: 0, // Will be calculated when voting starts
+        executed_at: None,
+        clawback_reason: None,
+    };
+    
+    // Store clawback request
+    env.storage().instance().set(&DataKey::MilestoneClawbackRequest(clawback_id), &clawback_request);
+    
+    // Update grant's clawback requests list
+    let mut clawback_requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::MilestoneClawbackRequests(grant_id))
+        .unwrap_or_else(|| Vec::new(&env));
+    clawback_requests.push_back(clawback_id);
+    env.storage().instance().set(&DataKey::MilestoneClawbackRequests(grant_id), &clawback_requests);
+    
+    // Update global clawback request list
+    let mut all_clawback_requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::MilestoneClawbackIds)
+        .unwrap_or_else(|| Vec::new(&env));
+    all_clawback_requests.push_back(clawback_id);
+    env.storage().instance().set(&DataKey::MilestoneClawbackIds, &all_clawback_requests);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("milestone_clawback_proposed"), grant_id),
+        (clawback_id, milestone_claim_id, amount),
+    );
+    
+    Ok(clawback_id)
+}
+
+/// Vote on a milestone clawback request
+pub fn vote_milestone_clawback(
+    env: Env,
+    clawback_id: u64,
+    vote_for: bool,
+) -> Result<(), Error> {
+    // Get clawback request
+    let mut request: MilestoneClawbackRequest = env.storage().instance()
+        .get(&DataKey::MilestoneClawbackRequest(clawback_id))
+        .ok_or(Error::ClawbackRequestNotFound)?;
+    
+    // Validate status
+    if request.status != ClawbackStatus::Proposed {
+        return Err(Error::ClawbackAlreadyExecuted);
+    }
+    
+    // Check voting period
+    let now = env.ledger().timestamp();
+    if now > request.challenge_deadline {
+        request.status = ClawbackStatus::Expired;
+        env.storage().instance().set(&DataKey::MilestoneClawbackRequest(clawback_id), &request);
+        return Err(Error::ClawbackVotingExpired);
+    }
+    
+    // Check if already voted
+    if env.storage().instance().has(&DataKey::ClawbackVotes(clawback_id, env.invoker())) {
+        return Err(Error::AlreadyVoted);
+    }
+    
+    // Get voter's voting power (simplified - in practice this would be more complex)
+    let voting_power = get_voting_power(&env, env.invoker())?;
+    
+    // Record vote
+    env.storage().instance().set(&DataKey::ClawbackVotes(clawback_id, env.invoker()), vote_for);
+    
+    // Update vote counts
+    if vote_for {
+        request.votes_for += voting_power;
+    } else {
+        request.votes_against += voting_power;
+    }
+    request.total_voting_power += voting_power;
+    
+    // Check if voting threshold is met
+    let participation_threshold = (request.total_voting_power * MIN_CLAWBACK_VOTING_PARTICIPATION) / 10000;
+    let approval_threshold = (request.total_voting_power * CLAWBACK_VOTING_THRESHOLD) / 10000;
+    
+    if request.total_voting_power >= participation_threshold {
+        if request.votes_for >= approval_threshold {
+            request.status = ClawbackStatus::Approved;
+            execute_milestone_clawback(&env, clawback_id)?;
+        } else {
+            request.status = ClawbackStatus::Rejected;
+        }
+    }
+    
+    // Store updated request
+    env.storage().instance().set(&DataKey::MilestoneClawbackRequest(clawback_id), &request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("milestone_clawback_voted"), request.grant_id),
+        (clawback_id, vote_for, voting_power),
+    );
+    
+    Ok(())
+}
+
+/// Execute an approved milestone clawback
+fn execute_milestone_clawback(env: &Env, clawback_id: u64) -> Result<(), Error> {
+    let request: MilestoneClawbackRequest = env.storage().instance()
+        .get(&DataKey::MilestoneClawbackRequest(clawback_id))
+        .ok_or(Error::ClawbackRequestNotFound)?;
+    
+    // Get grant
+    let mut grant: Grant = env.storage().instance()
+        .get(&DataKey::Grant(request.grant_id))
+        .ok_or(Error::GrantNotFound)?;
+    
+    // Get token client
+    let token_client = token::Client::new(env, &grant.token_address);
+    
+    // Transfer funds back from grantee to contract
+    token_client.transfer(&request.grantee, &env.current_contract_address(), &request.amount);
+    
+    // Update grant's available milestone funds
+    grant.available_milestone_funds += request.amount;
+    
+    // Store updated grant
+    env.storage().instance().set(&DataKey::Grant(request.grant_id), &grant);
+    
+    // Update request status
+    let mut updated_request = request;
+    updated_request.status = ClawbackStatus::Executed;
+    updated_request.executed_at = Some(env.ledger().timestamp());
+    env.storage().instance().set(&DataKey::MilestoneClawbackRequest(clawback_id), &updated_request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("milestone_clawback_executed"), request.grant_id),
+        (clawback_id, request.amount),
+    );
+    
+    Ok(())
+}
+
+fn get_next_milestone_clawback_request_id(env: &Env) -> u64 {
+    env.ledger().sequence + 4000000
+}
+
+fn get_voting_power(env: &Env, voter: Address) -> Result<i128, Error> {
+    // Simplified voting power calculation
+    // In practice, this would be more complex based on token holdings, governance participation, etc.
+    Ok(1000) // Base voting power
+}
+
+// #419: Asset-Trustline-Check Implementation
+
+/// Check if grantee has established trustline for the grant asset before stream start
+/// 
+/// This function verifies that the grantee has a proper trustline established for the
+/// asset that will be streamed to them. If not, it creates a record and allows time
+/// for the trustline to be established.
+pub fn check_grantee_trustline(
+    env: Env,
+    grant_id: u64,
+) -> Result<u64, Error> {
+    // Get grant details
+    let grant: Grant = env.storage().instance()
+        .get(&DataKey::Grant(grant_id))
+        .ok_or(Error::GrantNotFound)?;
+    
+    // Create trustline check record
+    let check_id = get_next_trustline_check_id(&env);
+    let now = env.ledger().timestamp();
+    
+    let mut status = TrustlineStatus::Pending;
+    let mut failure_reason = None;
+    
+    // Check if trustline exists
+    if let Ok(token_client) = token::Client::new(&env, &grant.token_address) {
+        // Try to get balance - this will fail if no trustline exists
+        match token_client.balance(&grant.recipient) {
+            Ok(_) => {
+                status = TrustlineStatus::Verified;
+            },
+            Err(_) => {
+                status = TrustlineStatus::Failed;
+                failure_reason = Some("No trustline established for asset".to_string());
+            }
+        }
+    } else {
+        status = TrustlineStatus::Failed;
+        failure_reason = Some("Invalid asset address".to_string());
+    }
+    
+    let check_record = TrustlineCheckRecord {
+        check_id,
+        grant_id,
+        grantee: grant.recipient,
+        asset_address: grant.token_address,
+        checked_at: now,
+        status,
+        failure_reason,
+        resolved_at: if status == TrustlineStatus::Verified { Some(now) } else { None },
+    };
+    
+    // Store trustline check record
+    env.storage().instance().set(&DataKey::TrustlineCheckRecord(check_id), &check_record);
+    
+    // Update grant's trustline check records list
+    let mut trustline_checks: Vec<u64> = env.storage().instance()
+        .get(&DataKey::TrustlineCheckRecords(grant_id))
+        .unwrap_or_else(|| Vec::new(&env));
+    trustline_checks.push_back(check_id);
+    env.storage().instance().set(&DataKey::TrustlineCheckRecords(grant_id), &trustline_checks);
+    
+    // Update global trustline check list
+    let mut all_trustline_checks: Vec<u64> = env.storage().instance()
+        .get(&DataKey::TrustlineCheckIds)
+        .unwrap_or_else(|| Vec::new(&env));
+    all_trustline_checks.push_back(check_id);
+    env.storage().instance().set(&DataKey::TrustlineCheckIds, &all_trustline_checks);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("trustline_checked"), grant_id),
+        (check_id, status),
+    );
+    
+    Ok(check_id)
+}
+
+/// Re-check a failed trustline check to see if it has been resolved
+pub fn recheck_trustline(
+    env: Env,
+    check_id: u64,
+) -> Result<(), Error> {
+    // Get trustline check record
+    let mut check_record: TrustlineCheckRecord = env.storage().instance()
+        .get(&DataKey::TrustlineCheckRecord(check_id))
+        .ok_or(Error::TrustlineCheckNotFound)?;
+    
+    // Check if already resolved or expired
+    if check_record.status == TrustlineStatus::Verified || 
+       check_record.status == TrustlineStatus::Resolved {
+        return Ok(());
+    }
+    
+    let now = env.ledger().timestamp();
+    if now > check_record.checked_at + TRUSTLINE_CHECK_TIMEOUT {
+        check_record.status = TrustlineStatus::Expired;
+        env.storage().instance().set(&DataKey::TrustlineCheckRecord(check_id), &check_record);
+        return Err(Error::TrustlineCheckExpired);
+    }
+    
+    // Re-check trustline
+    if let Ok(token_client) = token::Client::new(&env, &check_record.asset_address) {
+        match token_client.balance(&check_record.grantee) {
+            Ok(_) => {
+                check_record.status = TrustlineStatus::Resolved;
+                check_record.resolved_at = Some(now);
+                check_record.failure_reason = None;
+            },
+            Err(_) => {
+                // Still failed
+                check_record.failure_reason = Some("Trustline still not established".to_string());
+            }
+        }
+    }
+    
+    // Store updated record
+    env.storage().instance().set(&DataKey::TrustlineCheckRecord(check_id), &check_record);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("trustline_rechecked"), check_record.grant_id),
+        (check_id, check_record.status),
+    );
+    
+    Ok(())
+}
+
+/// Get trustline check status
+pub fn get_trustline_check_status(
+    env: Env,
+    check_id: u64,
+) -> Result<TrustlineCheckRecord, Error> {
+    let check_record: TrustlineCheckRecord = env.storage().instance()
+        .get(&DataKey::TrustlineCheckRecord(check_id))
+        .ok_or(Error::TrustlineCheckNotFound)?;
+    
+    Ok(check_record)
+}
+
+fn get_next_trustline_check_id(env: &Env) -> u64 {
+    env.ledger().sequence + 5000000
+}
+
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -6017,5 +6524,7 @@ mod test_inflation;
 mod test_yield;
 #[cfg(test)]
 mod test_fee;
+#[cfg(test)]
+mod test_milestone_clawback_trustline;
 #[cfg(test)]
 
