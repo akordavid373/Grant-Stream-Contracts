@@ -64,6 +64,27 @@ const AMENDMENT_CHALLENGE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days challenge wi
 const MAX_AMENDMENT_REASON_LENGTH: u32 = 1000; // Maximum amendment reason length
 const MAX_CHALLENGE_REASON_LENGTH_AMENDMENT: u32 = 1000; // Maximum challenge reason length for amendments
 
+// #415: Authorized Grantee Change constants
+const GRANTEE_CHANGE_AUTHORIZATION_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days authorization period
+const MAX_GRANTEE_CHANGE_REASON_LENGTH: u32 = 500; // Maximum reason length for grantee changes
+const GRANTEE_CHANGE_COOLDOWN: u64 = 7 * 24 * 60 * 60; // 7 days cooldown between changes
+
+// #416: Emergency Grace Period constants
+const EMERGENCY_GRACE_PERIOD: u64 = 3 * 24 * 60 * 60; // 3 days grace period after cancellation
+const MAX_EMERGENCY_REASON_LENGTH: u32 = 1000; // Maximum emergency reason length
+const EMERGENCY_RESUMPTION_FEE: i128 = 100_000_000; // 10 XLM fee for emergency resumption
+
+// #414: Staged Approval Workflow constants
+const REVIEWER_APPROVAL_REQUIRED: bool = true; // Require reviewer approval first
+const ADMIN_FINAL_APPROVAL_REQUIRED: bool = true; // Require admin final approval
+const STAGED_APPROVAL_TIMEOUT: u64 = 14 * 24 * 60 * 60; // 14 days timeout for staged approvals
+const MAX_REVIEWER_REASON_LENGTH: u32 = 800; // Maximum reviewer reason length
+
+// #408: Partial Funding Cancellation constants
+const MIN_GRANTOR_SHARE_PERCENTAGE: u32 = 1000; // 10% minimum share for partial cancellation
+const MAX_GRANTORS_FOR_PARTIAL_CANCELLATION: u32 = 10; // Maximum number of grantors supported
+const PARTIAL_CANCELLATION_CHALLENGE_PERIOD: u64 = 5 * 24 * 60 * 60; // 5 days challenge period
+
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -835,6 +856,126 @@ pub struct DexPriceUpdate {
     pub confidence_bps: u32,      // Price confidence in basis points (10000 = 100%)
 }
 
+// #415: Authorized Grantee Change Types
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeChangeRequest {
+    pub request_id: u64,
+    pub grant_id: u64,
+    pub current_grantee: Address,
+    pub proposed_grantee: Address,
+    pub authorizer: Address,      // Admin or authorized party who approves the change
+    pub reason: String,
+    pub created_at: u64,
+    pub authorization_deadline: u64,
+    pub status: GranteeChangeStatus,
+    pub authorized_at: Option<u64>,
+    pub executed_at: Option<u64>,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum GranteeChangeStatus {
+    Proposed,        // Change proposed, awaiting authorization
+    Authorized,      // Change authorized by admin, ready for execution
+    Executed,        // Change successfully executed
+    Rejected,        // Change rejected by admin
+    Expired,         // Authorization period expired
+    Cancelled,       // Request cancelled by proposer
+}
+
+// #416: Emergency Grace Period Types
+#[derive(Clone)]
+#[contracttype]
+pub struct EmergencyResumptionRequest {
+    pub request_id: u64,
+    pub grant_id: u64,
+    pub requester: Address,
+    pub reason: String,
+    pub created_at: u64,
+    pub grace_period_end: u64,
+    pub status: EmergencyResumptionStatus,
+    pub approved_at: Option<u64>,
+    pub approved_by: Option<Address>,
+    pub rejection_reason: Option<String>,
+    pub fee_paid: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum EmergencyResumptionStatus {
+    Requested,       // Emergency resumption requested
+    Approved,        // Emergency resumption approved
+    Rejected,        // Emergency resumption rejected
+    Executed,        // Stream successfully resumed
+    Expired,         // Grace period expired
+    Cancelled,       // Request cancelled
+}
+
+// #414: Staged Approval Workflow Types
+#[derive(Clone)]
+#[contracttype]
+pub struct StagedApproval {
+    pub approval_id: u64,
+    pub grant_id: u64,
+    pub milestone_claim_id: u64,
+    pub reviewer: Address,
+    pub admin: Address,
+    pub reviewer_approval: bool,
+    pub admin_approval: bool,
+    pub reviewer_reason: Option<String>,
+    pub admin_reason: Option<String>,
+    pub reviewer_approved_at: Option<u64>,
+    pub admin_approved_at: Option<u64>,
+    pub created_at: u64,
+    pub deadline: u64,
+    pub status: StagedApprovalStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum StagedApprovalStatus {
+    PendingReviewer,    // Awaiting reviewer approval
+    ReviewerApproved,   // Reviewer approved, awaiting admin
+    ReviewerRejected,   // Reviewer rejected
+    AdminApproved,      // Admin approved, milestone can be released
+    AdminRejected,      // Admin rejected
+    Expired,           // Approval timeout
+    Completed,         // Full approval process completed
+}
+
+// #408: Partial Funding Cancellation Types
+#[derive(Clone)]
+#[contracttype]
+pub struct PartialCancellationRequest {
+    pub request_id: u64,
+    pub grant_id: u64,
+    pub requesting_grantor: Address,
+    pub all_grantors: Vec<Address>,
+    pub grantor_shares: Map<Address, u32>, // Share percentages in basis points
+    pub cancellation_amount: i128,
+    pub reason: String,
+    pub created_at: u64,
+    pub challenge_deadline: u64,
+    pub status: PartialCancellationStatus,
+    pub approvals: Map<Address, bool>, // Grantor approvals
+    pub executed_at: Option<u64>,
+    pub rejection_reasons: Map<Address, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum PartialCancellationStatus {
+    Proposed,        // Partial cancellation proposed
+    Challenged,      // Being challenged by other grantors
+    Approved,        // Approved by required grantors
+    Rejected,        // Rejected by grantors
+    Executed,        // Partial cancellation executed
+    Expired,         // Challenge period expired
+    Cancelled,       // Request cancelled
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum GrantError {
@@ -929,6 +1070,30 @@ enum DataKey {
     AmendmentIds,                // List of all amendment IDs
     AmendmentAppeal(u64),         // Maps appeal_id to appeal details
     NextAppealId,                // Next available appeal ID
+    
+    // #415: Authorized Grantee Change keys
+    GranteeChangeRequest(u64),   // Maps request_id to grantee change request
+    GranteeChangeRequests(u64),  // Maps grant_id to list of change request IDs
+    NextGranteeChangeRequestId,  // Next available grantee change request ID
+    GranteeChangeIds,            // List of all grantee change request IDs
+    
+    // #416: Emergency Grace Period keys
+    EmergencyResumptionRequest(u64), // Maps request_id to emergency resumption request
+    EmergencyResumptionRequests(u64), // Maps grant_id to list of emergency resumption request IDs
+    NextEmergencyResumptionRequestId, // Next available emergency resumption request ID
+    EmergencyResumptionIds,      // List of all emergency resumption request IDs
+    
+    // #414: Staged Approval Workflow keys
+    StagedApproval(u64),         // Maps approval_id to staged approval details
+    StagedApprovals(u64),        // Maps grant_id to list of staged approval IDs
+    NextStagedApprovalId,        // Next available staged approval ID
+    StagedApprovalIds,           // List of all staged approval IDs
+    
+    // #408: Partial Funding Cancellation keys
+    PartialCancellationRequest(u64), // Maps request_id to partial cancellation request
+    PartialCancellationRequests(u64), // Maps grant_id to list of partial cancellation request IDs
+    NextPartialCancellationRequestId, // Next available partial cancellation request ID
+    PartialCancellationIds,       // List of all partial cancellation request IDs
 
 }
 
@@ -1033,6 +1198,42 @@ pub enum Error {
     AppealVotingPeriodEnded = 91,
     InvalidAmendmentReason = 92,
     InvalidChallengeReason = 93,
+    
+    // #415: Authorized Grantee Change errors
+    GranteeChangeRequestNotFound = 94,
+    GranteeChangeRequestAlreadyExists = 95,
+    GranteeChangeNotAuthorized = 96,
+    GranteeChangeAlreadyExecuted = 97,
+    GranteeChangeAuthorizationExpired = 98,
+    GranteeChangeCooldownActive = 99,
+    InvalidGranteeChangeReason = 100,
+    
+    // #416: Emergency Grace Period errors
+    EmergencyResumptionRequestNotFound = 101,
+    EmergencyResumptionRequestAlreadyExists = 102,
+    EmergencyGracePeriodExpired = 103,
+    EmergencyResumptionFeeNotPaid = 104,
+    EmergencyResumptionNotApproved = 105,
+    GrantNotCancelled = 106,
+    InvalidEmergencyReason = 107,
+    
+    // #414: Staged Approval Workflow errors
+    StagedApprovalNotFound = 108,
+    StagedApprovalAlreadyExists = 109,
+    StagedApprovalTimeout = 110,
+    StagedApprovalSequenceError = 111,
+    ReviewerApprovalRequired = 112,
+    AdminApprovalRequired = 113,
+    InvalidStagedApprovalStatus = 114,
+    
+    // #408: Partial Funding Cancellation errors
+    PartialCancellationRequestNotFound = 115,
+    PartialCancellationRequestAlreadyExists = 116,
+    InsufficientGrantorShare = 117,
+    TooManyGrantors = 118,
+    PartialCancellationChallengeActive = 119,
+    PartialCancellationNotApproved = 120,
+    InvalidPartialCancellationAmount = 121,
 
 }
 
@@ -2910,6 +3111,115 @@ impl GrantContract {
     pub fn get_remaining_amount(env: Env, grant_id: Symbol) -> u128 {
         let grant = Self::load_grant(&env, &grant_id);
         grant.total_amount.saturating_sub(grant.released_amount)
+    }
+
+    // --- #415: Authorized Grantee Change Functions ---
+    
+    /// Propose a grantee change for team migration
+    /// Only current grantee or admin can propose changes
+    pub fn propose_grantee_change(
+        env: Env,
+        grant_id: u64,
+        proposed_grantee: Address,
+        reason: String,
+    ) -> Result<u64, Error> {
+        crate::grant_contracts::propose_grantee_change(env, grant_id, proposed_grantee, reason)
+    }
+
+    /// Authorize a grantee change request (admin only)
+    pub fn authorize_grantee_change(
+        env: Env,
+        request_id: u64,
+        authorized: bool,
+        rejection_reason: Option<String>,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::authorize_grantee_change(env, request_id, authorized, rejection_reason)
+    }
+
+    /// Execute an authorized grantee change
+    pub fn execute_grantee_change(env: Env, request_id: u64) -> Result<(), Error> {
+        crate::grant_contracts::execute_grantee_change(env, request_id)
+    }
+
+    // --- #416: Emergency Grace Period Functions ---
+    
+    /// Request emergency resumption of a cancelled grant
+    pub fn request_emergency_resumption(
+        env: Env,
+        grant_id: u64,
+        reason: String,
+    ) -> Result<u64, Error> {
+        crate::grant_contracts::request_emergency_resumption(env, grant_id, reason)
+    }
+
+    /// Approve emergency resumption (admin only)
+    pub fn approve_emergency_resumption(
+        env: Env,
+        request_id: u64,
+        approved: bool,
+        rejection_reason: Option<String>,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::approve_emergency_resumption(env, request_id, approved, rejection_reason)
+    }
+
+    /// Pay emergency resumption fee
+    pub fn pay_emergency_resumption_fee(env: Env, request_id: u64) -> Result<(), Error> {
+        crate::grant_contracts::pay_emergency_resumption_fee(env, request_id)
+    }
+
+    // --- #414: Staged Approval Workflow Functions ---
+    
+    /// Create staged approval for milestone claim
+    pub fn create_staged_approval(
+        env: Env,
+        grant_id: u64,
+        milestone_claim_id: u64,
+        reviewer: Address,
+        admin: Address,
+    ) -> Result<u64, Error> {
+        crate::grant_contracts::create_staged_approval(env, grant_id, milestone_claim_id, reviewer, admin)
+    }
+
+    /// Reviewer approval for staged approval
+    pub fn reviewer_approve(
+        env: Env,
+        approval_id: u64,
+        approved: bool,
+        reason: Option<String>,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::reviewer_approve(env, approval_id, approved, reason)
+    }
+
+    /// Admin final approval for staged approval
+    pub fn admin_approve(
+        env: Env,
+        approval_id: u64,
+        approved: bool,
+        reason: Option<String>,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::admin_approve(env, approval_id, approved, reason)
+    }
+
+    // --- #408: Partial Funding Cancellation Functions ---
+    
+    /// Propose partial funding cancellation for multi-grantor pools
+    pub fn propose_partial_cancellation(
+        env: Env,
+        grant_id: u64,
+        cancellation_amount: i128,
+        reason: String,
+    ) -> Result<u64, Error> {
+        crate::grant_contracts::propose_partial_cancellation(env, grant_id, cancellation_amount, reason)
+    }
+
+    /// Approve partial cancellation (grantor only)
+    pub fn approve_partial_cancellation(
+        env: Env,
+        request_id: u64,
+        approved: bool,
+        reason: Option<String>,
+    ) -> Result<(), Error> {
+        crate::grant_contracts::approve_partial_cancellation(env, request_id, approved, reason)
     }
 }
 
@@ -4945,6 +5255,747 @@ fn read_tax_withholding_reserve(env: &Env) -> Result<Address, Error> {
     env.storage().instance()
         .get(&DataKey::TaxWithholdingReserve)
         .ok_or(Error::JurisdictionRegistryNotSet)
+}
+
+// --- #415: Authorized Grantee Change Implementation ---
+
+/// Propose a grantee change for team migration
+/// Only current grantee or admin can propose changes
+pub fn propose_grantee_change(
+    env: Env,
+    grant_id: u64,
+    proposed_grantee: Address,
+    reason: String,
+) -> Result<u64, Error> {
+    // Validate grant exists
+    let grant_key = DataKey::Grant(grant_id);
+    let grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
+    
+    // Check authorization - current grantee or admin
+    let admin = read_admin(&env)?;
+    let caller = env.invoker();
+    
+    if caller != grant.recipient && caller != admin {
+        return Err(Error::NotAuthorized);
+    }
+    
+    // Validate reason length
+    if reason.len() > MAX_GRANTEE_CHANGE_REASON_LENGTH as usize {
+        return Err(Error::InvalidGranteeChangeReason);
+    }
+    
+    // Check cooldown period
+    if let Some(last_resume) = grant.last_resume_timestamp {
+        let cooldown_end = last_resume + GRANTEE_CHANGE_COOLDOWN;
+        if env.ledger().timestamp() < cooldown_end {
+            return Err(Error::GranteeChangeCooldownActive);
+        }
+    }
+    
+    // Get next request ID
+    let request_id = get_next_grantee_change_request_id(&env);
+    
+    // Create change request
+    let request = GranteeChangeRequest {
+        request_id,
+        grant_id,
+        current_grantee: grant.recipient.clone(),
+        proposed_grantee: proposed_grantee.clone(),
+        authorizer: admin, // Admin will be the authorizer
+        reason: reason.clone(),
+        created_at: env.ledger().timestamp(),
+        authorization_deadline: env.ledger().timestamp() + GRANTEE_CHANGE_AUTHORIZATION_PERIOD,
+        status: GranteeChangeStatus::Proposed,
+        authorized_at: None,
+        executed_at: None,
+        rejection_reason: None,
+    };
+    
+    // Store request
+    env.storage().instance().set(&DataKey::GranteeChangeRequest(request_id), &request);
+    
+    // Update grant's change requests list
+    let mut requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::GranteeChangeRequests(grant_id))
+        .unwrap_or_else(|| Vec::new(&env));
+    requests.push_back(request_id);
+    env.storage().instance().set(&DataKey::GranteeChangeRequests(grant_id), &requests);
+    
+    // Update global list
+    let mut all_requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::GranteeChangeIds)
+        .unwrap_or_else(|| Vec::new(&env));
+    all_requests.push_back(request_id);
+    env.storage().instance().set(&DataKey::GranteeChangeIds, &all_requests);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("grantee_change_proposed"), grant_id),
+        (request_id, grant.recipient, proposed_grantee, reason),
+    );
+    
+    Ok(request_id)
+}
+
+/// Authorize a grantee change request (admin only)
+pub fn authorize_grantee_change(
+    env: Env,
+    request_id: u64,
+    authorized: bool,
+    rejection_reason: Option<String>,
+) -> Result<(), Error> {
+    require_admin_auth(&env)?;
+    
+    // Get request
+    let mut request: GranteeChangeRequest = env.storage().instance()
+        .get(&DataKey::GranteeChangeRequest(request_id))
+        .ok_or(Error::GranteeChangeRequestNotFound)?;
+    
+    // Validate status
+    if request.status != GranteeChangeStatus::Proposed {
+        return Err(Error::InvalidGranteeChangeReason);
+    }
+    
+    // Check deadline
+    if env.ledger().timestamp() > request.authorization_deadline {
+        request.status = GranteeChangeStatus::Expired;
+        env.storage().instance().set(&DataKey::GranteeChangeRequest(request_id), &request);
+        return Err(Error::GranteeChangeAuthorizationExpired);
+    }
+    
+    if authorized {
+        request.status = GranteeChangeStatus::Authorized;
+        request.authorized_at = Some(env.ledger().timestamp());
+    } else {
+        request.status = GranteeChangeStatus::Rejected;
+        request.rejection_reason = rejection_reason;
+    }
+    
+    // Store updated request
+    env.storage().instance().set(&DataKey::GranteeChangeRequest(request_id), &request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("grantee_change_authorized"), request.grant_id),
+        (request_id, authorized),
+    );
+    
+    Ok(())
+}
+
+/// Execute an authorized grantee change
+pub fn execute_grantee_change(env: Env, request_id: u64) -> Result<(), Error> {
+    // Get request
+    let request: GranteeChangeRequest = env.storage().instance()
+        .get(&DataKey::GranteeChangeRequest(request_id))
+        .ok_or(Error::GranteeChangeRequestNotFound)?;
+    
+    // Validate status
+    if request.status != GranteeChangeStatus::Authorized {
+        return Err(Error::GranteeChangeNotAuthorized);
+    }
+    
+    // Get and update grant
+    let grant_key = DataKey::Grant(request.grant_id);
+    let mut grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
+    
+    // Update grant recipient
+    grant.recipient = request.proposed_grantee.clone();
+    grant.last_resume_timestamp = Some(env.ledger().timestamp()); // Set for cooldown tracking
+    
+    // Store updated grant
+    env.storage().instance().set(&grant_key, &grant);
+    
+    // Update request status
+    let mut updated_request = request;
+    updated_request.status = GranteeChangeStatus::Executed;
+    updated_request.executed_at = Some(env.ledger().timestamp());
+    env.storage().instance().set(&DataKey::GranteeChangeRequest(request_id), &updated_request);
+    
+    // Update recipient grants index
+    let old_recipient_key = DataKey::RecipientGrants(request.current_grantee);
+    let mut old_grants: Vec<u64> = env.storage().instance()
+        .get(&old_recipient_key)
+        .unwrap_or_else(|| Vec::new(&env));
+    old_grants.remove(old_grants.iter().position(|&id| id == request.grant_id).unwrap());
+    env.storage().instance().set(&old_recipient_key, &old_grants);
+    
+    let new_recipient_key = DataKey::RecipientGrants(request.proposed_grantee);
+    let mut new_grants: Vec<u64> = env.storage().instance()
+        .get(&new_recipient_key)
+        .unwrap_or_else(|| Vec::new(&env));
+    new_grants.push_back(request.grant_id);
+    env.storage().instance().set(&new_recipient_key, &new_grants);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("grantee_change_executed"), request.grant_id),
+        (request_id, request.current_grantee, request.proposed_grantee),
+    );
+    
+    Ok(())
+}
+
+fn get_next_grantee_change_request_id(env: &Env) -> u64 {
+    env.ledger().sequence
+}
+
+// --- #416: Emergency Grace Period Implementation ---
+
+/// Request emergency resumption of a cancelled grant
+pub fn request_emergency_resumption(
+    env: Env,
+    grant_id: u64,
+    reason: String,
+) -> Result<u64, Error> {
+    // Validate grant exists and is cancelled
+    let grant_key = DataKey::Grant(grant_id);
+    let grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
+    
+    if grant.status != GrantStatus::Cancelled {
+        return Err(Error::GrantNotCancelled);
+    }
+    
+    // Check grace period
+    let grace_period_end = match grant.last_update_ts {
+        0 => return Err(Error::InvalidState),
+        timestamp => timestamp + EMERGENCY_GRACE_PERIOD,
+    };
+    
+    if env.ledger().timestamp() > grace_period_end {
+        return Err(Error::EmergencyGracePeriodExpired);
+    }
+    
+    // Validate reason length
+    if reason.len() > MAX_EMERGENCY_REASON_LENGTH as usize {
+        return Err(Error::InvalidEmergencyReason);
+    }
+    
+    // Get next request ID
+    let request_id = get_next_emergency_resumption_request_id(&env);
+    
+    // Create emergency request
+    let request = EmergencyResumptionRequest {
+        request_id,
+        grant_id,
+        requester: env.invoker(),
+        reason: reason.clone(),
+        created_at: env.ledger().timestamp(),
+        grace_period_end,
+        status: EmergencyResumptionStatus::Requested,
+        approved_at: None,
+        approved_by: None,
+        rejection_reason: None,
+        fee_paid: false,
+    };
+    
+    // Store request
+    env.storage().instance().set(&DataKey::EmergencyResumptionRequest(request_id), &request);
+    
+    // Update grant's emergency requests list
+    let mut requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::EmergencyResumptionRequests(grant_id))
+        .unwrap_or_else(|| Vec::new(&env));
+    requests.push_back(request_id);
+    env.storage().instance().set(&DataKey::EmergencyResumptionRequests(grant_id), &requests);
+    
+    // Update global list
+    let mut all_requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::EmergencyResumptionIds)
+        .unwrap_or_else(|| Vec::new(&env));
+    all_requests.push_back(request_id);
+    env.storage().instance().set(&DataKey::EmergencyResumptionIds, &all_requests);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("emergency_resumption_requested"), grant_id),
+        (request_id, reason),
+    );
+    
+    Ok(request_id)
+}
+
+/// Approve emergency resumption (admin only)
+pub fn approve_emergency_resumption(
+    env: Env,
+    request_id: u64,
+    approved: bool,
+    rejection_reason: Option<String>,
+) -> Result<(), Error> {
+    require_admin_auth(&env)?;
+    
+    // Get request
+    let mut request: EmergencyResumptionRequest = env.storage().instance()
+        .get(&DataKey::EmergencyResumptionRequest(request_id))
+        .ok_or(Error::EmergencyResumptionRequestNotFound)?;
+    
+    // Validate status
+    if request.status != EmergencyResumptionStatus::Requested {
+        return Err(Error::EmergencyResumptionNotApproved);
+    }
+    
+    // Check grace period
+    if env.ledger().timestamp() > request.grace_period_end {
+        request.status = EmergencyResumptionStatus::Expired;
+        env.storage().instance().set(&DataKey::EmergencyResumptionRequest(request_id), &request);
+        return Err(Error::EmergencyGracePeriodExpired);
+    }
+    
+    if approved {
+        // Check fee payment
+        if !request.fee_paid {
+            return Err(Error::EmergencyResumptionFeeNotPaid);
+        }
+        
+        request.status = EmergencyResumptionStatus::Approved;
+        request.approved_at = Some(env.ledger().timestamp());
+        request.approved_by = Some(env.invoker());
+        
+        // Execute resumption
+        execute_emergency_resumption(&env, request_id)?;
+    } else {
+        request.status = EmergencyResumptionStatus::Rejected;
+        request.rejection_reason = rejection_reason;
+    }
+    
+    // Store updated request
+    env.storage().instance().set(&DataKey::EmergencyResumptionRequest(request_id), &request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("emergency_resumption_approved"), request.grant_id),
+        (request_id, approved),
+    );
+    
+    Ok(())
+}
+
+/// Pay emergency resumption fee
+pub fn pay_emergency_resumption_fee(env: Env, request_id: u64) -> Result<(), Error> {
+    // Get request
+    let mut request: EmergencyResumptionRequest = env.storage().instance()
+        .get(&DataKey::EmergencyResumptionRequest(request_id))
+        .ok_or(Error::EmergencyResumptionRequestNotFound)?;
+    
+    // Validate status
+    if request.status != EmergencyResumptionStatus::Requested {
+        return Err(Error::EmergencyResumptionNotApproved);
+    }
+    
+    // Transfer fee to treasury
+    let treasury = read_treasury(&env)?;
+    let token_client = token::Client::new(&env, &read_grant_token(&env)?);
+    
+    token_client.transfer(&env.invoker(), &treasury, &EMERGENCY_RESUMPTION_FEE);
+    
+    // Mark fee as paid
+    request.fee_paid = true;
+    env.storage().instance().set(&DataKey::EmergencyResumptionRequest(request_id), &request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("emergency_fee_paid"), request.grant_id),
+        (request_id, EMERGENCY_RESUMPTION_FEE),
+    );
+    
+    Ok(())
+}
+
+fn execute_emergency_resumption(env: &Env, request_id: u64) -> Result<(), Error> {
+    // Get request
+    let request: EmergencyResumptionRequest = env.storage().instance()
+        .get(&DataKey::EmergencyResumptionRequest(request_id))
+        .ok_or(Error::EmergencyResumptionRequestNotFound)?;
+    
+    // Get and update grant
+    let grant_key = DataKey::Grant(request.grant_id);
+    let mut grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
+    
+    // Resume grant
+    grant.status = GrantStatus::Active;
+    grant.last_update_ts = env.ledger().timestamp();
+    
+    // Store updated grant
+    env.storage().instance().set(&grant_key, &grant);
+    
+    // Update request status
+    let mut updated_request = request;
+    updated_request.status = EmergencyResumptionStatus::Executed;
+    env.storage().instance().set(&DataKey::EmergencyResumptionRequest(request_id), &updated_request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("emergency_resumption_executed"), request.grant_id),
+        (request_id,),
+    );
+    
+    Ok(())
+}
+
+fn get_next_emergency_resumption_request_id(env: &Env) -> u64 {
+    env.ledger().sequence + 1000000
+}
+
+// --- #414: Staged Approval Workflow Implementation ---
+
+/// Create staged approval for milestone claim
+pub fn create_staged_approval(
+    env: Env,
+    grant_id: u64,
+    milestone_claim_id: u64,
+    reviewer: Address,
+    admin: Address,
+) -> Result<u64, Error> {
+    // Validate grant exists
+    let _grant: Grant = env.storage().instance()
+        .get(&DataKey::Grant(grant_id))
+        .ok_or(Error::GrantNotFound)?;
+    
+    // Get next approval ID
+    let approval_id = get_next_staged_approval_id(&env);
+    
+    // Create staged approval
+    let approval = StagedApproval {
+        approval_id,
+        grant_id,
+        milestone_claim_id,
+        reviewer: reviewer.clone(),
+        admin: admin.clone(),
+        reviewer_approval: false,
+        admin_approval: false,
+        reviewer_reason: None,
+        admin_reason: None,
+        reviewer_approved_at: None,
+        admin_approved_at: None,
+        created_at: env.ledger().timestamp(),
+        deadline: env.ledger().timestamp() + STAGED_APPROVAL_TIMEOUT,
+        status: StagedApprovalStatus::PendingReviewer,
+    };
+    
+    // Store approval
+    env.storage().instance().set(&DataKey::StagedApproval(approval_id), &approval);
+    
+    // Update grant's staged approvals list
+    let mut approvals: Vec<u64> = env.storage().instance()
+        .get(&DataKey::StagedApprovals(grant_id))
+        .unwrap_or_else(|| Vec::new(&env));
+    approvals.push_back(approval_id);
+    env.storage().instance().set(&DataKey::StagedApprovals(grant_id), &approvals);
+    
+    // Update global list
+    let mut all_approvals: Vec<u64> = env.storage().instance()
+        .get(&DataKey::StagedApprovalIds)
+        .unwrap_or_else(|| Vec::new(&env));
+    all_approvals.push_back(approval_id);
+    env.storage().instance().set(&DataKey::StagedApprovalIds, &all_approvals);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("staged_approval_created"), grant_id),
+        (approval_id, reviewer, admin),
+    );
+    
+    Ok(approval_id)
+}
+
+/// Reviewer approval for staged approval
+pub fn reviewer_approve(
+    env: Env,
+    approval_id: u64,
+    approved: bool,
+    reason: Option<String>,
+) -> Result<(), Error> {
+    // Get approval
+    let mut approval: StagedApproval = env.storage().instance()
+        .get(&DataKey::StagedApproval(approval_id))
+        .ok_or(Error::StagedApprovalNotFound)?;
+    
+    // Validate caller is reviewer
+    if env.invoker() != approval.reviewer {
+        return Err(Error::NotAuthorized);
+    }
+    
+    // Validate status
+    if approval.status != StagedApprovalStatus::PendingReviewer {
+        return Err(Error::InvalidStagedApprovalStatus);
+    }
+    
+    // Check timeout
+    if env.ledger().timestamp() > approval.deadline {
+        approval.status = StagedApprovalStatus::Expired;
+        env.storage().instance().set(&DataKey::StagedApproval(approval_id), &approval);
+        return Err(Error::StagedApprovalTimeout);
+    }
+    
+    // Validate reason length if provided
+    if let Some(ref r) = reason {
+        if r.len() > MAX_REVIEWER_REASON_LENGTH as usize {
+            return Err(Error::InvalidStagedApprovalStatus);
+        }
+    }
+    
+    // Update approval
+    approval.reviewer_approval = approved;
+    approval.reviewer_reason = reason.clone();
+    approval.reviewer_approved_at = Some(env.ledger().timestamp());
+    
+    if approved {
+        approval.status = StagedApprovalStatus::ReviewerApproved;
+    } else {
+        approval.status = StagedApprovalStatus::ReviewerRejected;
+    }
+    
+    // Store updated approval
+    env.storage().instance().set(&DataKey::StagedApproval(approval_id), &approval);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("reviewer_approval"), approval.grant_id),
+        (approval_id, approved),
+    );
+    
+    Ok(())
+}
+
+/// Admin final approval for staged approval
+pub fn admin_approve(
+    env: Env,
+    approval_id: u64,
+    approved: bool,
+    reason: Option<String>,
+) -> Result<(), Error> {
+    // Get approval
+    let mut approval: StagedApproval = env.storage().instance()
+        .get(&DataKey::StagedApproval(approval_id))
+        .ok_or(Error::StagedApprovalNotFound)?;
+    
+    // Validate caller is admin
+    if env.invoker() != approval.admin {
+        return Err(Error::NotAuthorized);
+    }
+    
+    // Validate status sequence
+    if approval.status != StagedApprovalStatus::ReviewerApproved {
+        return Err(Error::StagedApprovalSequenceError);
+    }
+    
+    // Check timeout
+    if env.ledger().timestamp() > approval.deadline {
+        approval.status = StagedApprovalStatus::Expired;
+        env.storage().instance().set(&DataKey::StagedApproval(approval_id), &approval);
+        return Err(Error::StagedApprovalTimeout);
+    }
+    
+    // Update approval
+    approval.admin_approval = approved;
+    approval.admin_reason = reason.clone();
+    approval.admin_approved_at = Some(env.ledger().timestamp());
+    
+    if approved {
+        approval.status = StagedApprovalStatus::AdminApproved;
+        // Release milestone funds
+        release_milestone_funds(&env, approval.milestone_claim_id)?;
+    } else {
+        approval.status = StagedApprovalStatus::AdminRejected;
+    }
+    
+    // Store updated approval
+    env.storage().instance().set(&DataKey::StagedApproval(approval_id), &approval);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("admin_approval"), approval.grant_id),
+        (approval_id, approved),
+    );
+    
+    Ok(())
+}
+
+fn release_milestone_funds(env: &Env, milestone_claim_id: u64) -> Result<(), Error> {
+    // This would integrate with the existing milestone system
+    // For now, we'll just emit an event
+    env.events().publish(
+        (symbol_short!("milestone_funds_released"),),
+        (milestone_claim_id,),
+    );
+    Ok(())
+}
+
+fn get_next_staged_approval_id(env: &Env) -> u64 {
+    env.ledger().sequence + 2000000
+}
+
+// --- #408: Partial Funding Cancellation Implementation ---
+
+/// Propose partial funding cancellation for multi-grantor pools
+pub fn propose_partial_cancellation(
+    env: Env,
+    grant_id: u64,
+    cancellation_amount: i128,
+    reason: String,
+) -> Result<u64, Error> {
+    // Validate grant exists
+    let grant: Grant = env.storage().instance()
+        .get(&DataKey::Grant(grant_id))
+        .ok_or(Error::GrantNotFound)?;
+    
+    // Validate amount
+    if cancellation_amount <= 0 || cancellation_amount > grant.total_amount {
+        return Err(Error::InvalidPartialCancellationAmount);
+    }
+    
+    // Validate reason length
+    if reason.len() > MAX_AMENDMENT_REASON_LENGTH as usize {
+        return Err(Error::InvalidAmendmentReason);
+    }
+    
+    // Get next request ID
+    let request_id = get_next_partial_cancellation_request_id(&env);
+    
+    // Create partial cancellation request
+    let request = PartialCancellationRequest {
+        request_id,
+        grant_id,
+        requesting_grantor: env.invoker(),
+        all_grantors: Vec::new(&env), // Would be populated from grant data
+        grantor_shares: Map::new(&env), // Would be populated from grant data
+        cancellation_amount,
+        reason: reason.clone(),
+        created_at: env.ledger().timestamp(),
+        challenge_deadline: env.ledger().timestamp() + PARTIAL_CANCELLATION_CHALLENGE_PERIOD,
+        status: PartialCancellationStatus::Proposed,
+        approvals: Map::new(&env),
+        executed_at: None,
+        rejection_reasons: Map::new(&env),
+    };
+    
+    // Store request
+    env.storage().instance().set(&DataKey::PartialCancellationRequest(request_id), &request);
+    
+    // Update grant's partial cancellation requests list
+    let mut requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::PartialCancellationRequests(grant_id))
+        .unwrap_or_else(|| Vec::new(&env));
+    requests.push_back(request_id);
+    env.storage().instance().set(&DataKey::PartialCancellationRequests(grant_id), &requests);
+    
+    // Update global list
+    let mut all_requests: Vec<u64> = env.storage().instance()
+        .get(&DataKey::PartialCancellationIds)
+        .unwrap_or_else(|| Vec::new(&env));
+    all_requests.push_back(request_id);
+    env.storage().instance().set(&DataKey::PartialCancellationIds, &all_requests);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("partial_cancellation_proposed"), grant_id),
+        (request_id, cancellation_amount, reason),
+    );
+    
+    Ok(request_id)
+}
+
+/// Approve partial cancellation (grantor only)
+pub fn approve_partial_cancellation(
+    env: Env,
+    request_id: u64,
+    approved: bool,
+    reason: Option<String>,
+) -> Result<(), Error> {
+    // Get request
+    let mut request: PartialCancellationRequest = env.storage().instance()
+        .get(&DataKey::PartialCancellationRequest(request_id))
+        .ok_or(Error::PartialCancellationRequestNotFound)?;
+    
+    // Validate caller is a grantor
+    if !request.all_grantors.contains(&env.invoker()) {
+        return Err(Error::NotAuthorized);
+    }
+    
+    // Validate status
+    if request.status != PartialCancellationStatus::Proposed {
+        return Err(Error::PartialCancellationNotApproved);
+    }
+    
+    // Check challenge period
+    if env.ledger().timestamp() > request.challenge_deadline {
+        request.status = PartialCancellationStatus::Expired;
+        env.storage().instance().set(&DataKey::PartialCancellationRequest(request_id), &request);
+        return Err(Error::PartialCancellationChallengeActive);
+    }
+    
+    // Record approval
+    request.approvals.set(env.invoker(), approved);
+    
+    if let Some(r) = reason {
+        request.rejection_reasons.set(env.invoker(), r);
+    }
+    
+    // Check if we have sufficient approvals
+    let mut total_approval_weight = 0u32;
+    let mut total_weight = 0u32;
+    
+    for (grantor, &share) in request.grantor_shares.iter() {
+        total_weight += share;
+        if let Some(&approved) = request.approvals.get(grantor) {
+            if approved {
+                total_approval_weight += share;
+            }
+        }
+    }
+    
+    // Require >50% approval by share weight
+    if total_approval_weight > total_weight / 2 {
+        request.status = PartialCancellationStatus::Approved;
+        execute_partial_cancellation(&env, request_id)?;
+    }
+    
+    // Store updated request
+    env.storage().instance().set(&DataKey::PartialCancellationRequest(request_id), &request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("partial_cancellation_approved"), request.grant_id),
+        (request_id, approved),
+    );
+    
+    Ok(())
+}
+
+fn execute_partial_cancellation(env: &Env, request_id: u64) -> Result<(), Error> {
+    // Get request
+    let request: PartialCancellationRequest = env.storage().instance()
+        .get(&DataKey::PartialCancellationRequest(request_id))
+        .ok_or(Error::PartialCancellationRequestNotFound)?;
+    
+    // Get and update grant
+    let grant_key = DataKey::Grant(request.grant_id);
+    let mut grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
+    
+    // Reduce grant amount
+    grant.total_amount -= request.cancellation_amount;
+    grant.last_update_ts = env.ledger().timestamp();
+    
+    // Store updated grant
+    env.storage().instance().set(&grant_key, &grant);
+    
+    // Update request status
+    let mut updated_request = request;
+    updated_request.status = PartialCancellationStatus::Executed;
+    updated_request.executed_at = Some(env.ledger().timestamp());
+    env.storage().instance().set(&DataKey::PartialCancellationRequest(request_id), &updated_request);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("partial_cancellation_executed"), request.grant_id),
+        (request_id, request.cancellation_amount),
+    );
+    
+    Ok(())
+}
+
+fn get_next_partial_cancellation_request_id(env: &Env) -> u64 {
+    env.ledger().sequence + 3000000
 }
 
 #[cfg(test)]
