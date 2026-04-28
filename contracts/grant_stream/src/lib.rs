@@ -549,6 +549,10 @@ impl GrantStreamContract {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
 
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }

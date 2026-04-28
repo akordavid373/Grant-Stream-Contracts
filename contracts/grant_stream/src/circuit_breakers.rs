@@ -208,6 +208,8 @@ pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> bool {
         panic!("Contract is in SoftPause — admin verification required");
     }
 
+    assert!(amount > 0, "record_withdrawal_velocity: amount must be positive");
+
     let now: u64 = env.ledger().timestamp();
     let window_start: u64 = env
         .storage()
