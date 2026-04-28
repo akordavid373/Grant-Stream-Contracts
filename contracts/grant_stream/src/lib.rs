@@ -23,6 +23,7 @@ const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 
 // --- Submodules ---
+pub mod storage_keys;
 pub mod multi_token;
 pub mod yield_treasury;
 pub mod optimized;
@@ -48,15 +49,8 @@ pub enum GrantStatus {
     RageQuitted,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Grant(u64),
-    Milestone(u64, u32),
-    Admin,
-    Treasury,
-    // … other existing keys …
-}
+// Import the unified storage keys
+use crate::storage_keys::StorageKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -116,18 +110,9 @@ pub struct Grant {
 pub struct GrantStream;
 
 
-#[derive(Clone)]
-#[contracttype]
-enum DataKey {
-    Admin,
-    GrantToken,
-    GrantIds,
-    Treasury,
-    Oracle,
-    NativeToken,
-    Grant(u64),
-    RecipientGrants(Address),
-}
+// Legacy DataKey alias for backward compatibility
+// TODO: Migrate all usage to StorageKey
+type DataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -157,11 +142,11 @@ pub enum Error {
 // --- Internal Helpers ---
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::Admin).ok_or(Error::NotInitialized)
 }
 
 fn read_oracle(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::Oracle).ok_or(Error::NotInitialized)
 }
 
 fn require_admin_auth(env: &Env) -> Result<(), Error> {
@@ -175,25 +160,25 @@ fn require_oracle_auth(env: &Env) -> Result<(), Error> {
 }
 
 fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
-    env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
+    env.storage().instance().get(&StorageKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
 }
 
 fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+    env.storage().instance().set(&StorageKey::Grant(grant_id), grant);
 }
 
 fn read_grant_token(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::GrantToken).ok_or(Error::NotInitialized)
 }
 
 fn read_treasury(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::Treasury).ok_or(Error::NotInitialized)
 }
 
 fn read_grant_ids(env: &Env) -> Vec<u64> {
     env.storage()
         .instance()
-        .get(&DataKey::GrantIds)
+        .get(&StorageKey::GrantIds)
         .unwrap_or_else(|| Vec::new(env))
 }
 
@@ -202,7 +187,7 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let ids = read_grant_ids(env);
     for i in 0..ids.len() {
         let grant_id = ids.get(i).unwrap();
-        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
             if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
                 let remaining = grant.total_amount
                     .checked_sub(grant.withdrawn)
@@ -219,7 +204,7 @@ fn count_active_grants(env: &Env) -> u32 {
     let ids = read_grant_ids(env);
     for i in 0..ids.len() {
         let grant_id = ids.get(i).unwrap();
-        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
             if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
                 count = count.saturating_add(1);
             }
@@ -341,14 +326,14 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let grant: Grant = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Grant(grant_id))
+                .get(&StorageKey::Grant(grant_id))
                 .expect("grant not found");
  
             grant.recipient.require_auth();
  
             // ── Milestone validation ──────────────────────────────────────
             // (existing logic unchanged)
-            let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+            let milestone_key = StorageKey::Milestone(grant_id, milestone_index);
             let milestone_proof: Symbol = env
                 .storage()
                 .persistent()
@@ -376,7 +361,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             updated_grant.streamed_amount += claimable;
             env.storage()
                 .persistent()
-                .set(&DataKey::Grant(grant_id), &updated_grant);
+                .set(&StorageKey::Grant(grant_id), &updated_grant);
  
             // ── Emit event ────────────────────────────────────────────────
             env.events().publish(
@@ -399,7 +384,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let admin: Address = env
                 .storage()
                 .instance()
-                .get(&DataKey::Admin)
+                .get(&StorageKey::Admin)
                 .expect("admin not set");
             admin.require_auth();
  
@@ -407,7 +392,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let grant: Grant = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Grant(grant_id))
+                .get(&StorageKey::Grant(grant_id))
                 .expect("grant not found");
  
             // ── Compute remaining balance ─────────────────────────────────
@@ -428,7 +413,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             updated_grant.streamed_amount = updated_grant.total_amount;
             env.storage()
                 .persistent()
-                .set(&DataKey::Grant(grant_id), &updated_grant);
+                .set(&StorageKey::Grant(grant_id), &updated_grant);
  
             // ── Emit emergency event ──────────────────────────────────────
             env.events().publish(
@@ -474,15 +459,15 @@ impl GrantStreamContract {
         oracle: Address,
         native_token: Address,
     ) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&StorageKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
-        env.storage().instance().set(&DataKey::Treasury, &treasury);
-        env.storage().instance().set(&DataKey::Oracle, &oracle);
-        env.storage().instance().set(&DataKey::NativeToken, &native_token);
-        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        env.storage().instance().set(&StorageKey::GrantToken, &grant_token);
+        env.storage().instance().set(&StorageKey::Treasury, &treasury);
+        env.storage().instance().set(&StorageKey::Oracle, &oracle);
+        env.storage().instance().set(&StorageKey::NativeToken, &native_token);
+        env.storage().instance().set(&StorageKey::GrantIds, &Vec::<u64>::new(&env));
         Ok(())
     }
 
@@ -506,7 +491,7 @@ impl GrantStreamContract {
             return Err(Error::InvalidAmount);
         }
 
-        let key = DataKey::Grant(grant_id);
+        let key = StorageKey::Grant(grant_id);
         if env.storage().instance().has(&key) {
             return Err(Error::GrantAlreadyExists);
         }
@@ -540,9 +525,9 @@ impl GrantStreamContract {
 
         let mut ids = read_grant_ids(&env);
         ids.push_back(grant_id);
-        env.storage().instance().set(&DataKey::GrantIds, &ids);
+        env.storage().instance().set(&StorageKey::GrantIds, &ids);
 
-        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let recipient_key = StorageKey::RecipientGrants(recipient.clone());
         let mut user_grants: Vec<u64> = env.storage().instance().get(&recipient_key).unwrap_or(vec![&env]);
         user_grants.push_back(grant_id);
         env.storage().instance().set(&recipient_key, &user_grants);
@@ -1198,7 +1183,7 @@ impl GrantStreamContract {
         }
 
         // Cleanup state: Remove grant from storage
-        env.storage().instance().remove(&DataKey::Grant(grant_id));
+        env.storage().instance().remove(&StorageKey::Grant(grant_id));
 
         // Update grant ID tracking lists
         let ids = read_grant_ids(&env);
@@ -1208,9 +1193,9 @@ impl GrantStreamContract {
                 new_ids.push_back(id);
             }
         }
-        env.storage().instance().set(&DataKey::GrantIds, &new_ids);
+        env.storage().instance().set(&StorageKey::GrantIds, &new_ids);
 
-        let recipient_key = DataKey::RecipientGrants(grant.recipient.clone());
+        let recipient_key = StorageKey::RecipientGrants(grant.recipient.clone());
         if let Some(user_grants) = env.storage().instance().get::<_, Vec<u64>>(&recipient_key) {
             let mut new_user_grants: Vec<u64> = Vec::new(&env);
             for id in user_grants.iter() {
@@ -1224,7 +1209,7 @@ impl GrantStreamContract {
         // Incentive: Bounty from native token (XLM)
         // 100,000 stroops (0.01 XLM) as a symbolic cleanup reward
         let bounty_amount: i128 = 100_000; 
-        let native_token_addr: Address = env.storage().instance().get(&DataKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
         let native_client = token::Client::new(&env, &native_token_addr);
         
         if native_client.balance(&env.current_contract_address()) >= bounty_amount {

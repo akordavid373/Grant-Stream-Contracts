@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, 
     token, Vec, Map, IntoVal, TryIntoVal, TryFromVal, Symbol,
 };
+use crate::storage_keys::StorageKey;
 
 #[contract]
 pub struct YieldTreasuryContract;
@@ -64,16 +65,9 @@ pub struct YieldMetrics {
     pub investment_count: u32,
 }
 
-#[derive(Clone)]
-#[contracttype]
-pub enum DataKey {
-    Admin,
-    Config,
-    YieldPosition,
-    Metrics,
-    ReserveBalance,
-    YieldToken, // Token address for yield generation
-}
+// Legacy DataKey type alias for backward compatibility
+// TODO: Migrate all usage to StorageKey
+type DataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -99,7 +93,7 @@ pub enum YieldError {
 fn read_admin(env: &Env) -> Result<Address, YieldError> {
     env.storage()
         .instance()
-        .get(&DataKey::Admin)
+        .get(&StorageKey::Admin)
         .ok_or(YieldError::NotInitialized)
 }
 
@@ -112,52 +106,52 @@ fn require_admin_auth(env: &Env) -> Result<(), YieldError> {
 fn read_config(env: &Env) -> Result<TreasuryConfig, YieldError> {
     env.storage()
         .instance()
-        .get(&DataKey::Config)
+        .get(&StorageKey::Config)
         .ok_or(YieldError::NotInitialized)
 }
 
 fn write_config(env: &Env, config: &TreasuryConfig) {
-    env.storage().instance().set(&DataKey::Config, config);
+    env.storage().instance().set(&StorageKey::Config, config);
 }
 
 fn read_yield_position(env: &Env) -> Result<YieldPosition, YieldError> {
     env.storage()
         .instance()
-        .get(&DataKey::YieldPosition)
+        .get(&StorageKey::YieldPosition)
         .ok_or(YieldError::InvestmentInactive)
 }
 
 fn write_yield_position(env: &Env, position: &YieldPosition) {
-    env.storage().instance().set(&DataKey::YieldPosition, position);
+    env.storage().instance().set(&StorageKey::YieldPosition, position);
 }
 
 fn read_metrics(env: &Env) -> Result<YieldMetrics, YieldError> {
     env.storage()
         .instance()
-        .get(&DataKey::Metrics)
+        .get(&StorageKey::Metrics)
         .ok_or(YieldError::NotInitialized)
 }
 
 fn write_metrics(env: &Env, metrics: &YieldMetrics) {
-    env.storage().instance().set(&DataKey::Metrics, metrics);
+    env.storage().instance().set(&StorageKey::Metrics, metrics);
 }
 
 fn read_reserve_balance(env: &Env) -> Result<i128, YieldError> {
     env.storage()
         .instance()
-        .get(&DataKey::ReserveBalance)
+        .get(&StorageKey::ReserveBalance)
         .ok_or(YieldError::NotInitialized)
 }
 
 fn write_reserve_balance(env: &Env, balance: i128) {
-    env.storage().instance().set(&DataKey::ReserveBalance, &balance);
+    env.storage().instance().set(&StorageKey::ReserveBalance, &balance);
 }
 
 fn read_yield_token(env: &Env) -> Result<token::Client, YieldError> {
     let token_address = env
         .storage()
         .instance()
-        .get(&DataKey::YieldToken)
+        .get(&StorageKey::YieldToken)
         .ok_or(YieldError::NotInitialized)?;
     Ok(token::Client::new(env, &token_address))
 }
@@ -240,17 +234,17 @@ impl YieldTreasuryContract {
         yield_token_address: Address,
         initial_config: TreasuryConfig,
     ) -> Result<(), YieldError> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&StorageKey::Admin) {
             return Err(YieldError::AlreadyInitialized);
         }
         
         admin.require_auth();
         
         // Set admin
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&StorageKey::Admin, &admin);
         
         // Set yield token
-        env.storage().instance().set(&DataKey::YieldToken, &yield_token_address);
+        env.storage().instance().set(&StorageKey::YieldToken, &yield_token_address);
         
         // Initialize config
         let config = TreasuryConfig {
@@ -455,7 +449,7 @@ impl YieldTreasuryContract {
         
         // If fully divested, remove position
         if remaining_value == 0 {
-            env.storage().instance().remove(&DataKey::YieldPosition);
+            env.storage().instance().remove(&StorageKey::YieldPosition);
         } else {
             write_yield_position(&env, &position);
         }
