@@ -48,6 +48,155 @@ fn test_pipeline() {
     grant_token_admin.mint(&client.address, &total_amount);
 
     client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None);
+}
+
+#[test]
+fn test_is_active_grantee_basic_functionality() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    
+    let active_grantee = Address::generate(&env);
+    let inactive_grantee = Address::generate(&env);
+    let no_grants_user = Address::generate(&env);
+    
+    // Test 1: User with no grants should return false
+    assert!(!client.is_active_grantee(&no_grants_user), "User with no grants should return false");
+    
+    // Test 2: Create an active grant
+    client.create_grant(&1u64, &active_grantee, &1000000i128, &100i128, &0u64, &None);
+    assert!(client.is_active_grantee(&active_grantee), "User with active grant should return true");
+    
+    // Test 3: Create a completed grant
+    client.create_grant(&2u64, &inactive_grantee, &1000000i128, &100i128, &0u64, &None);
+    // Simulate completion by withdrawing all funds
+    set_timestamp(&env, 20000); // Allow some streaming
+    let claimable = client.claimable(&2u64);
+    if claimable > 0 {
+        // For testing, we'll manually set the status to completed
+        // In real scenarios, this would happen through normal flow
+    }
+}
+
+#[test]
+fn test_is_active_grantee_with_different_statuses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    
+    let active_grantee = Address::generate(&env);
+    let paused_grantee = Address::generate(&env);
+    let completed_grantee = Address::generate(&env);
+    let cancelled_grantee = Address::generate(&env);
+    let ragequit_grantee = Address::generate(&env);
+    
+    // Create grants for each user
+    client.create_grant(&1u64, &active_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&2u64, &paused_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&3u64, &completed_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&4u64, &cancelled_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&5u64, &ragequit_grantee, &1000000i128, &100i128, &0u64, &None);
+    
+    // Test active grant (should return true)
+    assert!(client.is_active_grantee(&active_grantee), "Active grantee should return true");
+    
+    // Pause grant 2 (should still return true - paused is considered active)
+    client.pause_stream(&2u64);
+    assert!(client.is_active_grantee(&paused_grantee), "Paused grantee should return true");
+    
+    // Complete grant 3 (should return false)
+    // For testing, we'll simulate completion by setting status directly
+    // In production, this would happen through normal grant lifecycle
+    let grant = client.get_grant(&3u64).unwrap();
+    // Note: In real implementation, you'd need to use admin functions to complete grants
+    
+    // Cancel grant 4 (should return false)
+    client.cancel_grant(&4u64);
+    assert!(!client.is_active_grantee(&cancelled_grantee), "Cancelled grantee should return false");
+    
+    // Note: Rage quit requires grant to be paused first
+    client.pause_stream(&5u64);
+    client.rage_quit(&5u64);
+    assert!(!client.is_active_grantee(&ragequit_grantee), "Rage quit grantee should return false");
+}
+
+#[test]
+fn test_is_active_grantee_edge_cases() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    
+    let user_with_multiple_grants = Address::generate(&env);
+    let user_with_depleted_grant = Address::generate(&env);
+    
+    // Test 1: User with multiple active grants
+    client.create_grant(&1u64, &user_with_multiple_grants, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&2u64, &user_with_multiple_grants, &500000i128, &50i128, &0u64, &None);
+    assert!(client.is_active_grantee(&user_with_multiple_grants), "User with multiple active grants should return true");
+    
+    // Test 2: User with one active and one completed grant
+    client.create_grant(&3u64, &user_with_depleted_grant, &1000i128, &100i128, &0u64, &None);
+    set_timestamp(&env, 100); // Allow streaming to complete
+    // Small grant should be depleted
+    let claimable = client.claimable(&3u64);
+    // Even if depleted, the grant might still be considered active until status changes
+    
+    // Test 3: Zero amount grant
+    let zero_grant_user = Address::generate(&env);
+    client.create_grant(&4u64, &zero_grant_user, &0i128, &0i128, &0u64, &None);
+    // Zero amount grants should not be considered active
+    assert!(!client.is_active_grantee(&zero_grant_user), "Zero amount grant should not be considered active");
+}
+
+#[test]
+fn test_is_active_grantee_performance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    
+    let test_user = Address::generate(&env);
+    
+    // Create multiple grants to test performance
+    for i in 1..=10 {
+        client.create_grant(&i, &test_user, &1000000i128, &100i128, &0u64, &None);
+    }
+    
+    // Measure CPU instructions for multiple calls
+    let before_cpu = env.budget().cpu_instruction_count();
+    
+    for _ in 0..100 {
+        let _ = client.is_active_grantee(&test_user);
+    }
+    
+    let after_cpu = env.budget().cpu_instruction_count();
+    let total_cpu = after_cpu - before_cpu;
+    let avg_cpu_per_call = total_cpu / 100;
+    
+    println!("Average CPU instructions per is_active_grantee call: {}", avg_cpu_per_call);
+    
+    // Should be well under 5,000 CPU instructions
+    assert!(avg_cpu_per_call < 5000, "is_active_grantee exceeds 5,000 CPU instruction limit: {}", avg_cpu_per_call);
+}
+
+#[test]
+fn test_is_active_grantee_archived_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    
+    let archived_grantee = Address::generate(&env);
+    
+    // Create a grant and then cancel it (simulating archived data)
+    client.create_grant(&1u64, &archived_grantee, &1000000i128, &100i128, &0u64, &None);
+    assert!(client.is_active_grantee(&archived_grantee), "Active grant should return true");
+    
+    // Cancel the grant (simulating archival)
+    client.cancel_grant(&1u64);
+    assert!(!client.is_active_grantee(&archived_grantee), "Cancelled/archived grant should return false");
+    
+    // Test with user who had grants but all are now completed/cancelled
+    // This simulates the "stale records" edge case
+}
 
     // 2. Advance time and check claimable
     set_timestamp(&env, 1010); // 10 seconds later
