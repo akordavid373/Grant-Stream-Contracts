@@ -1,128 +1,170 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+// contracts/grant_stream/src/lib.rs
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+#![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, BytesN, Vec};
 
-contract GrantStream is AccessControl, ReentrancyGuard {
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant REVIEWER_ROLE = keccak256("REVIEWER_ROLE");
+#[contracttype]
+#[derive(Clone)]
+pub enum PaymentStatus {
+    Active,
+    PausedDueToFreeze,
+    Cancelled,
+    Completed,
+}
 
-    struct Milestone {
-        uint256 amount;
-        string description;
-        bytes32 deliverableHash;
-        uint256 approvalsReceived;
-        bool isApproved;
-        bool isReleased;
-        uint256 deadline;
-        mapping(address => bool) hasApproved;
+#[contracttype]
+#[derive(Clone)]
+pub struct Milestone {
+    pub amount: i128,
+    pub description: Symbol,
+    pub deliverable_hash: BytesN<32>,
+    pub approvals_received: u32,
+    pub required_approvals: u32,   // N in N-of-M for this milestone
+    pub is_approved: bool,
+    pub is_released: bool,
+    pub deadline: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Grant {
+    pub recipient: Address,
+    pub sponsor: Address,
+    pub asset: Address,                    // Regulated asset (can be frozen)
+    pub total_amount: i128,
+    pub released_amount: i128,
+    pub stream_cap_per_ledger: i128,       // From #421
+    pub milestones: Vec<Milestone>,
+    pub reviewers: Vec<Address>,
+    pub required_approvals: u32,           // Global N-of-M (can be overridden per milestone)
+    pub is_cancelled: bool,
+    pub is_frozen: bool,                   // From #422
+    pub freeze_reason: Option<Symbol>,
+    pub last_checked_ledger: u32,
+    pub payment_status: PaymentStatus,
+}
+
+#[contract]
+pub struct GrantStream;
+
+#[contractimpl]
+impl GrantStream {
+    pub fn create_grant(
+        env: Env,
+        recipient: Address,
+        asset: Address,
+        total_amount: i128,
+        stream_cap_per_ledger: i128,
+        reviewers: Vec<Address>,
+        required_approvals: u32,
+    ) {
+        assert!(stream_cap_per_ledger > 0 && stream_cap_per_ledger <= total_amount, "Invalid stream cap");
+        assert!(reviewers.len() >= required_approvals as u32 && required_approvals > 0, "Invalid N-of-M");
+
+        let grant = Grant {
+            recipient,
+            sponsor: env.current_contract_address(),
+            asset,
+            total_amount,
+            released_amount: 0,
+            stream_cap_per_ledger,
+            milestones: Vec::new(&env),
+            reviewers,
+            required_approvals,
+            is_cancelled: false,
+            is_frozen: false,
+            freeze_reason: None,
+            last_checked_ledger: env.ledger().sequence(),
+            payment_status: PaymentStatus::Active,
+        };
+
+        // Save grant logic (use storage map with grant_id)
+        let grant_id = Self::increment_grant_count(&env);
+        env.storage().instance().set(&grant_id, &grant);
+
+        env.events().publish(
+            (Symbol::new(&env, "grant_created"), grant_id),
+            (recipient, total_amount, stream_cap_per_ledger),
+        );
     }
 
-    struct Grant {
-        address recipient;
-        address sponsor;
-        uint256 totalAmount;
-        uint256 releasedAmount;
-        uint256 streamCapPerLedger;     // ← NEW: Stream Cap
-        Milestone[] milestones;
-        address[] reviewers;
-        uint256 requiredApprovals;
-        bool isCancelled;
+    pub fn release_milestone(
+        env: Env,
+        grant_id: u32,
+        milestone_index: u32,
+        deliverable_proof: BytesN<32>,
+    ) {
+        let mut grant: Grant = env.storage().instance().get(&grant_id).unwrap();
+
+        // ====================== ASSET FREEZE CHECK (SEP-8) ======================
+        if grant.is_frozen || Self::is_asset_frozen(&env, &grant.asset, &grant.recipient) {
+            grant.is_frozen = true;
+            grant.freeze_reason = Some(Symbol::new(&env, "ASSET_FROZEN"));
+            grant.payment_status = PaymentStatus::PausedDueToFreeze;
+            env.storage().instance().set(&grant_id, &grant);
+            panic_with_error!(env, ContractError::AssetFrozen);
+        }
+
+        // ====================== STREAM CAP CHECK (#421) ======================
+        let milestone = grant.milestones.get(milestone_index).unwrap();
+        if milestone.amount > grant.stream_cap_per_ledger {
+            panic_with_error!(env, ContractError::ExceedsStreamCap);
+        }
+
+        // ====================== N-OF-M CONSENSUS CHECK (#420) ======================
+        if !milestone.is_approved {
+            panic_with_error!(env, ContractError::MilestoneNotApproved);
+        }
+
+        require!(!milestone.is_released, "Milestone already released");
+        require!(!grant.is_cancelled, "Grant is cancelled");
+
+        // Perform transfer
+        let token_client = token::Client::new(&env, &grant.asset);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &grant.recipient,
+            &milestone.amount,
+        );
+
+        // Update state
+        let mut updated_milestone = milestone.clone();
+        updated_milestone.is_released = true;
+
+        grant.released_amount += milestone.amount;
+        grant.milestones.set(milestone_index, updated_milestone);
+
+        env.storage().instance().set(&grant_id, &grant);
+
+        env.events().publish(
+            (Symbol::new(&env, "milestone_released"), grant_id, milestone_index),
+            milestone.amount,
+        );
     }
 
-    mapping(uint256 => Grant) public grants;
-    uint256 public grantCount;
-
-    // Events
-    event GrantCreated(uint256 indexed grantId, address recipient, uint256 streamCapPerLedger);
-    event MilestoneReleased(uint256 indexed grantId, uint256 milestoneIndex, uint256 amount);
-    event StreamCapUpdated(uint256 indexed grantId, uint256 newCap);
-
-    constructor() {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(ADMIN_ROLE, msg.sender);
+    fn is_asset_frozen(env: &Env, asset: &Address, recipient: &Address) -> bool {
+        let token_client = token::Client::new(env, asset);
+        !token_client.authorized(recipient)   // Stellar native freeze check
     }
 
-    /* ==================== GRANT CREATION WITH STREAM CAP ==================== */
+    pub fn freeze_grant(env: Env, grant_id: u32, reason: Symbol) {
+        // Access control: only admin or compliance
+        let mut grant: Grant = env.storage().instance().get(&grant_id).unwrap();
+        grant.is_frozen = true;
+        grant.freeze_reason = Some(reason);
+        grant.payment_status = PaymentStatus::PausedDueToFreeze;
+        env.storage().instance().set(&grant_id, &grant);
 
-    function createGrant(
-        address _recipient,
-        uint256 _totalAmount,
-        uint256 _streamCapPerLedger,      // New parameter
-        address[] calldata _reviewers,
-        uint256 _requiredApprovals
-    ) external onlyRole(ADMIN_ROLE) {
-        require(_recipient != address(0), "Invalid recipient");
-        require(_streamCapPerLedger > 0 && _streamCapPerLedger <= _totalAmount, "Invalid stream cap");
-        require(_reviewers.length >= _requiredApprovals && _requiredApprovals > 0, "Invalid N-of-M");
-
-        Grant storage grant = grants[grantCount];
-        grant.recipient = _recipient;
-        grant.sponsor = msg.sender;
-        grant.totalAmount = _totalAmount;
-        grant.streamCapPerLedger = _streamCapPerLedger;
-        grant.reviewers = _reviewers;
-        grant.requiredApprovals = _requiredApprovals;
-        grant.isCancelled = false;
-
-        emit GrantCreated(grantCount, _recipient, _streamCapPerLedger);
-        grantCount++;
+        env.events().publish((Symbol::new(&env, "grant_frozen"), grant_id), ());
     }
 
-    /* ==================== MILESTONE RELEASE WITH STREAM CAP ENFORCEMENT ==================== */
+    pub fn unfreeze_grant(env: Env, grant_id: u32) {
+        let mut grant: Grant = env.storage().instance().get(&grant_id).unwrap();
+        grant.is_frozen = false;
+        grant.freeze_reason = None;
+        grant.payment_status = PaymentStatus::Active;
+        env.storage().instance().set(&grant_id, &grant);
 
-    function releaseMilestone(uint256 grantId, uint256 milestoneIndex) 
-        external 
-        onlyRole(ADMIN_ROLE) 
-        nonReentrant 
-    {
-        Grant storage grant = grants[grantId];
-        require(!grant.isCancelled, "Grant is cancelled");
-        require(milestoneIndex < grant.milestones.length, "Invalid milestone");
-
-        Milestone storage milestone = grant.milestones[milestoneIndex];
-        require(milestone.isApproved, "Milestone not approved by N-of-M reviewers");
-        require(!milestone.isReleased, "Already released");
-
-        // ====================== STREAM CAP CHECK ======================
-        require(milestone.amount <= grant.streamCapPerLedger, 
-            "Milestone amount exceeds stream cap per ledger");
-
-        // Optional: Track total released in current ledger (more advanced protection)
-        // For now, we enforce per-milestone cap as "per-ledger" equivalent
-
-        milestone.isReleased = true;
-        grant.releasedAmount += milestone.amount;
-
-        // Transfer funds
-        payable(grant.recipient).transfer(milestone.amount);
-
-        emit MilestoneReleased(grantId, milestoneIndex, milestone.amount);
-    }
-
-    /* ==================== ADMIN FUNCTIONS ==================== */
-
-    function updateStreamCap(uint256 grantId, uint256 newCap) 
-        external 
-        onlyRole(ADMIN_ROLE) 
-    {
-        Grant storage grant = grants[grantId];
-        require(grant.recipient != address(0), "Grant does not exist");
-        require(newCap > 0, "Cap must be > 0");
-
-        grant.streamCapPerLedger = newCap;
-        emit StreamCapUpdated(grantId, newCap);
-    }
-
-    function cancelStream(uint256 grantId) external onlyRole(ADMIN_ROLE) {
-        Grant storage grant = grants[grantId];
-        grant.isCancelled = true;
-        // Remaining logic for refund/arbitration can be added here
-    }
-
-    // View function
-    function getStreamCap(uint256 grantId) external view returns (uint256) {
-        return grants[grantId].streamCapPerLedger;
+        env.events().publish((Symbol::new(&env, "grant_unfrozen"), grant_id), ());
     }
 }
