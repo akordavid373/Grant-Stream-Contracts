@@ -6,7 +6,7 @@ Smart contracts for managing grant streams with milestone completion proof hashi
 
 This repository contains multiple implementations for grant management:
 1. **Soroban (Stellar) Implementation**: High-precision per-second streaming with legal anchoring and cross-chain interoperability.
-2. **Solidity (Ethereum/L2) Implementation**: Milestone-based releasing with integrated dispute resolution and ZK proofs.
+2. **Solidity (Ethereum/L2) Implementation**: Milestone-based releasing with integrated dispute resolution and ZK proofs and new work.
 
 ---
 
