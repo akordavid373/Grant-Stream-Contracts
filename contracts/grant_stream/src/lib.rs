@@ -1262,6 +1262,19 @@ impl GrantStreamContract {
             return Err(Error::GrantNotPurgeable);
         }
 
+        // 3. Completed grants must be fully accounted before deletion.
+        // This prevents accidental state deletion if any user funds are still
+        // represented in grant accounting due to an upstream bug.
+        if grant.status == GrantStatus::Completed {
+            let accounted = grant.withdrawn
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            if accounted != grant.total_amount {
+                return Err(Error::GrantNotPurgeable);
+            }
+        }
+
         // Cleanup state: Remove grant from storage
         env.storage().instance().remove(&DataKey::Grant(grant_id));
 

@@ -184,3 +184,26 @@ fn test_milestone_proof_nonce_replay_is_rejected() {
     assert!(after_cancel.is_err(), "cancelled grants must reject new proofs");
 }
 
+#[test]
+fn test_finalize_and_purge_rejects_pending_claims() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 88u64;
+    let total_amount = 1_000 * SCALING_FACTOR;
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
+
+    // Generate recipient claimable and then cancel; pending claim must block purge.
+    set_timestamp(&env, 1100);
+    client.cancel_grant(&grant_id);
+
+    let purger = Address::generate(&env);
+    let result = client.try_finalize_and_purge(&grant_id, &purger);
+    assert!(result.is_err(), "must not purge while recipient claim remains withdrawable");
+}
+
