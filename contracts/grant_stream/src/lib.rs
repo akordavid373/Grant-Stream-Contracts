@@ -126,6 +126,8 @@ enum DataKey {
     Oracle,
     NativeToken,
     Grant(u64),
+    Milestone(u64, u32),
+    MilestoneSubmitNonce(u64),
     RecipientGrants(Address),
 }
 
@@ -152,6 +154,7 @@ pub enum Error {
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
+    InvalidNonce = 20,
 }
 
 // --- Internal Helpers ---
@@ -195,6 +198,19 @@ fn read_grant_ids(env: &Env) -> Vec<u64> {
         .instance()
         .get(&DataKey::GrantIds)
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_expected_milestone_nonce(env: &Env, grant_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneSubmitNonce(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_expected_milestone_nonce(env: &Env, grant_id: u64, next_nonce: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MilestoneSubmitNonce(grant_id), &next_nonce);
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -1152,6 +1168,55 @@ impl GrantStreamContract {
             (symbol_short!("legalsig"), grant.recipient.clone(), admin, grant_token, grant_id),
             env.ledger().timestamp(),
         );
+        Ok(())
+    }
+
+    /// Submit an off-chain milestone proof with monotonic nonce protection.
+    ///
+    /// Replay prevention:
+    /// - Every grant tracks an expected nonce starting at 0.
+    /// - Submission is accepted only when `nonce == expected_nonce`.
+    /// - The expected nonce is incremented after a successful write.
+    ///
+    /// Cancellation edge case:
+    /// - Cancelled / rage-quit / completed grants reject new milestone proofs.
+    pub fn submit_milestone_proof(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        proof: Symbol,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status == GrantStatus::Cancelled
+            || grant.status == GrantStatus::RageQuitted
+            || grant.status == GrantStatus::Completed
+        {
+            return Err(Error::InvalidState);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+        if env.storage().persistent().has(&milestone_key) {
+            return Err(Error::InvalidState);
+        }
+
+        let expected_nonce = read_expected_milestone_nonce(&env, grant_id);
+        if nonce != expected_nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        env.storage().persistent().set(&milestone_key, &proof);
+
+        let next_nonce = nonce.checked_add(1).ok_or(Error::MathOverflow)?;
+        write_expected_milestone_nonce(&env, grant_id, next_nonce);
+
+        env.events().publish(
+            (symbol_short!("mil_sub"),),
+            (grant_id, milestone_index, nonce),
+        );
+
         Ok(())
     }
 
