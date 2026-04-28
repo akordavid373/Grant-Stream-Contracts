@@ -13,6 +13,7 @@ use soroban_sdk::{
     Vec,
     Map,
 };
+use crate::storage_keys::StorageKey;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -73,26 +74,9 @@ pub struct VotingPower {
     pub last_updated: u64,
 }
 
-#[derive(Clone)]
-#[contracttype]
-pub enum GovernanceDataKey {
-    Proposal(u64),
-    Vote(Address, u64),
-    VotingPower(Address),
-    ProposalIds,
-    GovernanceToken,
-    VotingThreshold,
-    QuorumThreshold,
-    // Stores raw XDR bytes of each council member address.
-    // Using Vec<Bytes> instead of Vec<Address> avoids Address object
-    // construction on every iteration of the membership check loop.
-    CouncilMembers,
-    StakeToken,
-    ProposalStakeAmount,
-    OptimisticLimit,
-    ChallengeBond,
-    ConvictionAlpha, // Basis points (e.g., 9000 = 0.9)
-}
+// Legacy GovernanceDataKey type alias for backward compatibility
+// TODO: Migrate all usage to StorageKey
+type GovernanceDataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]

@@ -23,6 +23,7 @@ const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 
 // --- Submodules ---
+pub mod storage_keys;
 pub mod multi_token;
 pub mod yield_treasury;
 pub mod optimized;
@@ -48,15 +49,8 @@ pub enum GrantStatus {
     RageQuitted,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Grant(u64),
-    Milestone(u64, u32),
-    Admin,
-    Treasury,
-    // … other existing keys …
-}
+// Import the unified storage keys
+use crate::storage_keys::StorageKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -96,6 +90,8 @@ pub struct Grant {
     pub requires_legal_signature: bool,
     /// Boolean flag indicating if the legal document has been signed by the grantee.
     pub is_legal_signed: bool,
+    /// Optional reason string for why the grant was paused
+    pub pause_reason: Option<String>,
 }
 
 
@@ -116,20 +112,9 @@ pub struct Grant {
 pub struct GrantStream;
 
 
-#[derive(Clone)]
-#[contracttype]
-enum DataKey {
-    Admin,
-    GrantToken,
-    GrantIds,
-    Treasury,
-    Oracle,
-    NativeToken,
-    Grant(u64),
-    Milestone(u64, u32),
-    MilestoneSubmitNonce(u64),
-    RecipientGrants(Address),
-}
+// Legacy DataKey alias for backward compatibility
+// TODO: Migrate all usage to StorageKey
+type DataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -160,11 +145,11 @@ pub enum Error {
 // --- Internal Helpers ---
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::Admin).ok_or(Error::NotInitialized)
 }
 
 fn read_oracle(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::Oracle).ok_or(Error::NotInitialized)
 }
 
 fn require_admin_auth(env: &Env) -> Result<(), Error> {
@@ -178,25 +163,25 @@ fn require_oracle_auth(env: &Env) -> Result<(), Error> {
 }
 
 fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
-    env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
+    env.storage().instance().get(&StorageKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
 }
 
 fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+    env.storage().instance().set(&StorageKey::Grant(grant_id), grant);
 }
 
 fn read_grant_token(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::GrantToken).ok_or(Error::NotInitialized)
 }
 
 fn read_treasury(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+    env.storage().instance().get(&StorageKey::Treasury).ok_or(Error::NotInitialized)
 }
 
 fn read_grant_ids(env: &Env) -> Vec<u64> {
     env.storage()
         .instance()
-        .get(&DataKey::GrantIds)
+        .get(&StorageKey::GrantIds)
         .unwrap_or_else(|| Vec::new(env))
 }
 
@@ -218,7 +203,7 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let ids = read_grant_ids(env);
     for i in 0..ids.len() {
         let grant_id = ids.get(i).unwrap();
-        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
             if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
                 let remaining = grant.total_amount
                     .checked_sub(grant.withdrawn)
@@ -235,7 +220,7 @@ fn count_active_grants(env: &Env) -> u32 {
     let ids = read_grant_ids(env);
     for i in 0..ids.len() {
         let grant_id = ids.get(i).unwrap();
-        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
             if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
                 count = count.saturating_add(1);
             }
@@ -357,14 +342,14 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let grant: Grant = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Grant(grant_id))
+                .get(&StorageKey::Grant(grant_id))
                 .expect("grant not found");
  
             grant.recipient.require_auth();
  
             // ── Milestone validation ──────────────────────────────────────
             // (existing logic unchanged)
-            let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+            let milestone_key = StorageKey::Milestone(grant_id, milestone_index);
             let milestone_proof: Symbol = env
                 .storage()
                 .persistent()
@@ -392,7 +377,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             updated_grant.streamed_amount += claimable;
             env.storage()
                 .persistent()
-                .set(&DataKey::Grant(grant_id), &updated_grant);
+                .set(&StorageKey::Grant(grant_id), &updated_grant);
  
             // ── Emit event ────────────────────────────────────────────────
             env.events().publish(
@@ -415,7 +400,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let admin: Address = env
                 .storage()
                 .instance()
-                .get(&DataKey::Admin)
+                .get(&StorageKey::Admin)
                 .expect("admin not set");
             admin.require_auth();
  
@@ -423,7 +408,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let grant: Grant = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Grant(grant_id))
+                .get(&StorageKey::Grant(grant_id))
                 .expect("grant not found");
  
             // ── Compute remaining balance ─────────────────────────────────
@@ -444,7 +429,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             updated_grant.streamed_amount = updated_grant.total_amount;
             env.storage()
                 .persistent()
-                .set(&DataKey::Grant(grant_id), &updated_grant);
+                .set(&StorageKey::Grant(grant_id), &updated_grant);
  
             // ── Emit emergency event ──────────────────────────────────────
             env.events().publish(
@@ -490,15 +475,15 @@ impl GrantStreamContract {
         oracle: Address,
         native_token: Address,
     ) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&StorageKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
-        env.storage().instance().set(&DataKey::Treasury, &treasury);
-        env.storage().instance().set(&DataKey::Oracle, &oracle);
-        env.storage().instance().set(&DataKey::NativeToken, &native_token);
-        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        env.storage().instance().set(&StorageKey::GrantToken, &grant_token);
+        env.storage().instance().set(&StorageKey::Treasury, &treasury);
+        env.storage().instance().set(&StorageKey::Oracle, &oracle);
+        env.storage().instance().set(&StorageKey::NativeToken, &native_token);
+        env.storage().instance().set(&StorageKey::GrantIds, &Vec::<u64>::new(&env));
         Ok(())
     }
 
@@ -522,7 +507,7 @@ impl GrantStreamContract {
             return Err(Error::InvalidAmount);
         }
 
-        let key = DataKey::Grant(grant_id);
+        let key = StorageKey::Grant(grant_id);
         if env.storage().instance().has(&key) {
             return Err(Error::GrantAlreadyExists);
         }
@@ -550,15 +535,16 @@ impl GrantStreamContract {
             legal_hash: None,
             requires_legal_signature: false,
             is_legal_signed: false,
+            pause_reason: None,
         };
 
         env.storage().instance().set(&key, &grant);
 
         let mut ids = read_grant_ids(&env);
         ids.push_back(grant_id);
-        env.storage().instance().set(&DataKey::GrantIds, &ids);
+        env.storage().instance().set(&StorageKey::GrantIds, &ids);
 
-        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let recipient_key = StorageKey::RecipientGrants(recipient.clone());
         let mut user_grants: Vec<u64> = env.storage().instance().get(&recipient_key).unwrap_or(vec![&env]);
         user_grants.push_back(grant_id);
         env.storage().instance().set(&recipient_key, &user_grants);
@@ -641,14 +627,23 @@ impl GrantStreamContract {
         Ok(())
     }
 
-    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
+    pub fn pause_stream(env: Env, grant_id: u64, reason: Option<String>) -> Result<(), Error> {
         require_admin_auth(&env)?;
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
         settle_grant(&mut grant, env.ledger().timestamp())?;
         grant.status = GrantStatus::Paused;
+        grant.pause_reason = reason.clone();
         write_grant(&env, grant_id, &grant);
+        
+        // Emit ProtocolPaused event with reason
+        let admin = read_admin(&env)?;
+        let pause_reason_str = reason.unwrap_or_else(|| String::from_str(&env, "No reason provided"));
+        env.events().publish(
+            (symbol_short!("protocol_paused"), admin, grant_id),
+            pause_reason_str,
+        );
         Ok(())
     }
 
@@ -659,8 +654,38 @@ impl GrantStreamContract {
 
         grant.status = GrantStatus::Active;
         grant.last_update_ts = env.ledger().timestamp();
+        grant.pause_reason = None; // Clear pause reason on resume
         write_grant(&env, grant_id, &grant);
         Ok(())
+    }
+
+    /// Emergency pause function for protocol-wide emergency stops
+    /// Stores the reason in contract state and emits ProtocolPaused event
+    pub fn emergency_pause(env: Env, reason: String) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        // Store the emergency pause reason in contract state
+        env.storage().instance().set(&DataKey::ProtocolPauseReason, &reason);
+        
+        // Emit ProtocolPaused event for protocol-wide emergency pause
+        let admin = read_admin(&env)?;
+        env.events().publish(
+            (symbol_short!("protocol_paused"), admin, "EMERGENCY"),
+            reason,
+        );
+        
+        Ok(())
+    }
+
+    /// Get the pause reason for a specific grant
+    pub fn get_pause_reason(env: Env, grant_id: u64) -> Result<Option<String>, Error> {
+        let grant = read_grant(&env, grant_id)?;
+        Ok(grant.pause_reason)
+    }
+
+    /// Get the protocol-wide emergency pause reason
+    pub fn get_protocol_pause_reason(env: Env) -> Option<String> {
+        env.storage().instance().get(&DataKey::ProtocolPauseReason)
     }
 
     pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -1276,7 +1301,7 @@ impl GrantStreamContract {
         }
 
         // Cleanup state: Remove grant from storage
-        env.storage().instance().remove(&DataKey::Grant(grant_id));
+        env.storage().instance().remove(&StorageKey::Grant(grant_id));
 
         // Update grant ID tracking lists
         let ids = read_grant_ids(&env);
@@ -1286,9 +1311,9 @@ impl GrantStreamContract {
                 new_ids.push_back(id);
             }
         }
-        env.storage().instance().set(&DataKey::GrantIds, &new_ids);
+        env.storage().instance().set(&StorageKey::GrantIds, &new_ids);
 
-        let recipient_key = DataKey::RecipientGrants(grant.recipient.clone());
+        let recipient_key = StorageKey::RecipientGrants(grant.recipient.clone());
         if let Some(user_grants) = env.storage().instance().get::<_, Vec<u64>>(&recipient_key) {
             let mut new_user_grants: Vec<u64> = Vec::new(&env);
             for id in user_grants.iter() {
@@ -1302,7 +1327,7 @@ impl GrantStreamContract {
         // Incentive: Bounty from native token (XLM)
         // 100,000 stroops (0.01 XLM) as a symbolic cleanup reward
         let bounty_amount: i128 = 100_000; 
-        let native_token_addr: Address = env.storage().instance().get(&DataKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
         let native_client = token::Client::new(&env, &native_token_addr);
         
         if native_client.balance(&env.current_contract_address()) >= bounty_amount {
@@ -1420,6 +1445,46 @@ impl GrantStreamContract {
     ) -> Option<multi_threshold::RescueProposal> {
         multi_threshold::get_proposal(&env, proposal_id)
     }
+
+    /// Check if a user is an active grantee (has Active or Paused grants).
+    /// This is a zero-gas, read-only function for partner protocols to verify
+    /// grantee status for "Builder Discounts" or specialized access.
+    /// Returns true if the user has at least one active, uncompleted grant.
+    /// Returns false for stale/archived records or users with no active grants.
+    /// Optimized for high-frequency cross-contract queries.
+    pub fn is_active_grantee(env: Env, address: Address) -> bool {
+        // Get all grant IDs for this recipient
+        let recipient_key = DataKey::RecipientGrants(address);
+        if let Some(user_grants) = env.storage().instance().get::<_, Vec<u64>>(&recipient_key) {
+            // Early exit if no grants found
+            if user_grants.is_empty() {
+                return false;
+            }
+            
+            // Check each grant for active status
+            for i in 0..user_grants.len() {
+                let grant_id = user_grants.get(i).unwrap();
+                if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+                    // Only consider Active or Paused grants as "active grantees"
+                    // Completed, Cancelled, and RageQuitted are not active
+                    if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
+                        // Additional check: ensure grant is not fully depleted
+                        let total_withdrawn = grant.withdrawn
+                            .checked_add(grant.validator_withdrawn).unwrap_or(0);
+                        let total_claimable = grant.claimable
+                            .checked_add(grant.validator_claimable).unwrap_or(0);
+                        
+                        // Grant is active if there are remaining funds to be streamed
+                        if total_withdrawn < grant.total_amount || total_claimable > 0 {
+                            return true;
+                        }
+                    }
+                }
+                // If grant doesn't exist (archived/purged), continue checking others
+            }
+        }
+        false
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -1443,3 +1508,5 @@ mod test_temporal_fuzz;
 mod test_global_invariant_fuzz;
 #[cfg(test)]
 mod test_security_invariants;
+#[cfg(test)]
+mod is_active_grantee_benchmark;
