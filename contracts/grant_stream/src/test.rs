@@ -198,28 +198,6 @@ fn test_is_active_grantee_archived_data() {
     // This simulates the "stale records" edge case
 }
 
-    // 2. Advance time and check claimable
-    set_timestamp(&env, 1010); // 10 seconds later
-    assert_eq!(client.claimable(&grant_id), 10 * SCALING_FACTOR);
-
-    // 3. Withdraw
-    client.withdraw(&grant_id, &(5 * SCALING_FACTOR));
-    assert_eq!(grant_token.balance(&recipient), 5 * SCALING_FACTOR);
-    assert_eq!(client.claimable(&grant_id), 5 * SCALING_FACTOR);
-
-    // 4. Propose Rate Increase (Timelocked)
-    let new_rate = 2 * SCALING_FACTOR;
-    client.propose_rate_change(&grant_id, &new_rate);
-    
-    let grant = client.get_grant(&grant_id);
-    assert_eq!(grant.pending_rate, new_rate);
-    assert_eq!(grant.effective_timestamp, 1010 + 48 * 60 * 60);
-
-    // 5. Advance time past timelock
-    set_timestamp(&env, 1010 + 48 * 60 * 60 + 10);
-    assert_eq!(client.claimable(&grant_id), 172825 * SCALING_FACTOR);
-}
-
 #[test]
 fn test_warmup() {
     let env = Env::default();

@@ -3,11 +3,6 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
     Symbol, vec, IntoVal, String, Map, xdr::ScVal, xdr::ToXdr, Bytes,
 };
-
-
-#![no_std]
- 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
  
 // PATCH: declare the new reentrancy module ───────────────────────────────────
 pub mod reentrancy;
