@@ -202,6 +202,41 @@ fn update_yield_position(env: &Env, position: &mut YieldPosition) -> Result<(), 
     Ok(())
 }
 
+fn preview_yield_position_value(position: &YieldPosition, now: u64) -> Result<i128, YieldError> {
+    if now <= position.last_yield_update {
+        return Ok(position.current_value);
+    }
+
+    let yield_since_update = calculate_yield_amount(position, now)?;
+    position.current_value
+        .checked_add(yield_since_update)
+        .ok_or(YieldError::MathOverflow)
+}
+
+pub fn preview_pool_health(env: Env, total_liabilities: i128) -> Result<i128, YieldError> {
+    let reserve = read_reserve_balance(&env)?;
+    let mut total_assets = reserve;
+
+    if let Ok(position) = read_yield_position(&env) {
+        let now = env.ledger().timestamp();
+        let current_value = preview_yield_position_value(&position, now)?;
+        total_assets = total_assets.checked_add(current_value).ok_or(YieldError::MathOverflow)?;
+    }
+
+    if total_liabilities <= 0 {
+        return Ok(10000); // 1.0 if no liabilities
+    }
+
+    let risk_adjusted_assets = total_assets.checked_mul(9000).ok_or(YieldError::MathOverflow)? / 10000;
+    let health_factor = risk_adjusted_assets
+        .checked_mul(10000)
+        .ok_or(YieldError::MathOverflow)?
+        .checked_div(total_liabilities)
+        .ok_or(YieldError::MathOverflow)?;
+
+    Ok(health_factor)
+}
+
 fn ensure_reserve_ratio(
     env: &Env, 
     total_balance: i128, 
