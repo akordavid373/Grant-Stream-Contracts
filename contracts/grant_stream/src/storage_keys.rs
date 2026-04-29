@@ -45,6 +45,8 @@ pub enum StorageKey {
     Grant(u64),
     /// Grant milestone data keyed by (grant_id, milestone_index)
     Milestone(u64, u32),
+    /// Expected monotonic nonce for off-chain milestone proof submission
+    MilestoneSubmitNonce(u64),
     /// Grant streaming metadata and configuration
     GrantStreamConfig(u64),
     /// Grant legal compliance data (hashes, signatures)
@@ -55,6 +57,12 @@ pub enum StorageKey {
     GrantMetrics(u64),
     /// Grant dispute status and resolution data
     GrantDisputeData(u64),
+    /// Grant donor information for clawback authorization
+    GrantDonor(u64),
+    /// Clawback checkpoint data to prevent double-spending
+    ClawbackCheckpoint(u64),
+    /// Dispute escrow balance for contested clawbacks
+    DisputeEscrow(u64),
     
     // ── User Data ───────────────────────────────────────────────────────────────
     
@@ -257,11 +265,15 @@ impl StorageKey {
             // Grant Management
             StorageKey::Grant(_)
             | StorageKey::Milestone(_, _)
+            | StorageKey::MilestoneSubmitNonce(_)
             | StorageKey::GrantStreamConfig(_)
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
             | StorageKey::GrantMetrics(_)
-            | StorageKey::GrantDisputeData(_) => "grant",
+            | StorageKey::GrantDisputeData(_)
+            | StorageKey::GrantDonor(_)
+            | StorageKey::ClawbackCheckpoint(_)
+            | StorageKey::DisputeEscrow(_) => "grant",
             
             // User Data
             StorageKey::RecipientGrants(_)
@@ -380,6 +392,9 @@ impl StorageKey {
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
             StorageKey::GrantMetrics(_) => "Grant performance metrics",
             StorageKey::GrantDisputeData(_) => "Grant dispute status",
+            StorageKey::GrantDonor(_) => "Grant donor information for clawback",
+            StorageKey::ClawbackCheckpoint(_) => "Clawback checkpoint to prevent double-spending",
+            StorageKey::DisputeEscrow(_) => "Dispute escrow balance for contested clawbacks",
             
             StorageKey::RecipientGrants(_) => "Grants associated with recipient",
             StorageKey::UserBalance(_) => "User balance information",

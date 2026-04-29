@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use soroban_sdk::testutils::{Ledger, LedgerInfo};
+use soroban_sdk::{Address, testutils::{Ledger, LedgerInfo}};
 use super::optimized::{GrantContract, STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED};
 
 #[test]
@@ -171,6 +171,63 @@ fn test_status_transition_validation() {
     // Test invalid transition: Completed -> Active (should fail)
     let result = GrantContract::pause_grant(&ledger, &contract_id, 3u64);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_milestone_evidence_anchor_required() {
+    let ledger_info = LedgerInfo {
+        protocol_version: 20,
+        sequence_number: 12345,
+        timestamp: 1620000000,
+        network_id: 1,
+        base_reserve: 10,
+        min_persistent_entry_fee: 100,
+        min_temp_entry_fee: 100,
+    };
+
+    let ledger = Ledger::with_info(&ledger_info);
+    let admin = Address::from_public_key(&[10; 32]);
+    let recipient = Address::from_public_key(&[11; 32]);
+    let contract_id = ledger.contract_id();
+
+    GrantContract::initialize(&ledger, &contract_id, admin);
+    let initial_flags = STATUS_ACTIVE | super::STATUS_MILESTONE_BASED;
+    GrantContract::create_grant(
+        &ledger,
+        &contract_id,
+        4u64,
+        recipient.clone(),
+        1000000i128,
+        100i128,
+        initial_flags,
+    )
+    .unwrap();
+
+    // The admin must first set a milestone deadline.
+    GrantContract::set_milestone_deadline(&ledger, &contract_id, 1u64, 1_700_000_000).unwrap();
+
+    // Approve must fail when evidence has not been anchored.
+    let result = GrantContract::mark_milestone_met(&ledger, &contract_id, 1u64);
+    assert!(result.is_err(), "milestone approval without evidence must fail");
+
+    // Submit the evidence anchor from the recipient.
+    ledger.set_source_account(&recipient);
+    GrantContract::submit_milestone_evidence(
+        &ledger,
+        &contract_id,
+        1u64,
+        "QmEvidenceHash".to_string(),
+    )
+    .unwrap();
+
+    // Admin may now approve the milestone.
+    ledger.set_source_account(&admin);
+    GrantContract::mark_milestone_met(&ledger, &contract_id, 1u64).unwrap();
+
+    // Reset deadline to a new review cycle and anchor should be cleared.
+    GrantContract::set_milestone_deadline(&ledger, &contract_id, 2u64, 1_800_000_000).unwrap();
+    let result = GrantContract::mark_milestone_met(&ledger, &contract_id, 2u64);
+    assert!(result.is_err(), "milestone approval must fail after deadline reset without new evidence");
 }
 
 #[test]

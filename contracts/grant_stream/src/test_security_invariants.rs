@@ -273,6 +273,37 @@ fn test_invariant_withdraw_exceeds_claimable_rejected() {
     assert!(g.claimable >= 0);
 }
 
+/// Attempting to withdraw zero or a negative amount must be rejected.
+#[test]
+fn test_invariant_withdraw_non_positive_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, grant_token_addr, _treasury, _oracle, _native, client) = setup(&env);
+
+    set_ts(&env, 1_000);
+
+    let recipient = Address::generate(&env);
+    let grant_id: u64 = 6;
+    let total_amount = 1_000 * SCALING_FACTOR;
+
+    mint_to_contract(&env, &grant_token_addr, &admin, &client.address, total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
+
+    set_ts(&env, 1_010);
+    let claimable = client.claimable(&grant_id);
+    assert!(claimable > 0);
+
+    let result_zero = client.try_withdraw(&grant_id, &0_i128);
+    assert!(result_zero.is_err(), "zero withdraw amount must be rejected");
+
+    let result_negative = client.try_withdraw(&grant_id, &(-1_i128));
+    assert!(result_negative.is_err(), "negative withdraw amount must be rejected");
+
+    let g = client.get_grant(&grant_id);
+    assert_eq!(g.withdrawn, 0);
+    assert_eq!(g.claimable, claimable);
+}
+
 // ---------------------------------------------------------------------------
 // Issue #306 – Status-Gated Liquidity Lock
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     Vec, Map,
 };
 
@@ -190,7 +190,7 @@ impl GrantContract {
                 }
             }
 
-            match Self::process_token_withdrawal(&mut grant, &withdrawal) {
+            match Self::process_token_withdrawal(&env, &mut grant, &withdrawal) {
                 Ok(amount_withdrawn) => {
                     successful_withdrawals.push_back(withdrawal.clone());
                     total_withdrawn.set(withdrawal.token_address, amount_withdrawn);
@@ -538,6 +538,7 @@ impl GrantContract {
 
     /// Process withdrawal for a specific token
     fn process_token_withdrawal(
+        env: &Env,
         grant: &mut MultiTokenGrant,
         withdrawal: &TokenWithdrawal,
     ) -> Result<i128, Error> {
@@ -563,6 +564,10 @@ impl GrantContract {
             return Err(Error::InvalidAmount);
         }
 
+        // Transfer tokens from contract to recipient before updating state
+        let token_client = token::Client::new(env, &withdrawal.token_address);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &withdrawal.amount);
+
         // Update token balance
         token_balance.claimable = token_balance
             .claimable
@@ -575,10 +580,6 @@ impl GrantContract {
             .ok_or(Error::MathOverflow)?;
         
         grant.tokens.set(token_index as u32, token_balance);
-
-        // In a real implementation, this would transfer the token
-        // For now, we'll simulate the transfer
-        // TODO: Implement actual token transfer logic
 
         Ok(withdrawal.amount)
     }
