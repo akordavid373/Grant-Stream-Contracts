@@ -45,6 +45,8 @@ pub enum StorageKey {
     Grant(u64),
     /// Grant milestone data keyed by (grant_id, milestone_index)
     Milestone(u64, u32),
+    /// Expected monotonic nonce for off-chain milestone proof submission
+    MilestoneSubmitNonce(u64),
     /// Grant streaming metadata and configuration
     GrantStreamConfig(u64),
     /// Grant legal compliance data (hashes, signatures)
@@ -244,6 +246,7 @@ impl StorageKey {
             // Grant Management
             StorageKey::Grant(_)
             | StorageKey::Milestone(_, _)
+            | StorageKey::MilestoneSubmitNonce(_)
             | StorageKey::GrantStreamConfig(_)
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
