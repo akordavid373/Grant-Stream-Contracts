@@ -17,8 +17,8 @@
 /// If the balance falls below a 3-month rent buffer, non-essential functions are disabled
 /// to preserve funds for storage maintenance.
 
-use soroban_sdk::{contracttype, Address, Env};
-use crate::{Error, storage_keys::StorageKey};
+use soroban_sdk::{contracttype, token, Address, Env};
+use crate::storage_keys::StorageKey;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -401,4 +401,36 @@ pub fn get_dispute_monitoring_stats(env: &Env) -> (u64, u32, u32, bool) {
     let halted: bool = is_grant_initialization_halted(env);
 
     (window_start, dispute_count, active_grants_snapshot, halted)
+}
+
+pub fn get_rent_buffer_threshold(_env: &Env) -> i128 {
+    RENT_BUFFER_XLM
+}
+
+pub fn get_current_xlm_balance(env: &Env) -> i128 {
+    if let Some(native_token) = env.storage().instance().get::<_, Address>(&StorageKey::NativeToken) {
+        let client = token::Client::new(env, &native_token);
+        client.balance(&env.current_contract_address())
+    } else {
+        0
+    }
+}
+
+pub fn is_rent_preservation_mode(env: &Env) -> bool {
+    env.storage().instance().get(&StorageKey::RentPreservationMode).unwrap_or(false)
+}
+
+pub fn check_rent_balance(env: &Env) -> bool {
+    let below_threshold = get_current_xlm_balance(env) < RENT_BUFFER_XLM;
+    env.storage().instance().set(&StorageKey::RentPreservationMode, &below_threshold);
+    below_threshold
+}
+
+pub fn is_function_allowed(env: &Env, essential: bool) -> bool {
+    essential || !is_rent_preservation_mode(env)
+}
+
+pub fn disable_rent_preservation_mode(env: &Env, admin: &Address) {
+    admin.require_auth();
+    env.storage().instance().set(&StorageKey::RentPreservationMode, &false);
 }

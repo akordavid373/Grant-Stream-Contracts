@@ -12,8 +12,7 @@
 ///
 /// Issue #336: Optimized signature verification and gas buffer for complex multi-sig transactions
 
-use crate::Error;
-use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec};
+use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec, xdr::ToXdr};
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
 
@@ -98,7 +97,7 @@ fn read_signers(env: &Env) -> Vec<Address> {
 /// Converts caller to Bytes once and compares against pre-serialized signer bytes
 fn is_signer(env: &Env, addr: &Address) -> bool {
     let signer_bytes = read_signer_bytes(env);
-    let addr_bytes = addr.to_xdr(env);
+    let addr_bytes = addr.clone().to_xdr(env);
     
     // Raw byte comparison is much faster than Address comparison in loops
     for i in 0..signer_bytes.len() {
@@ -136,7 +135,7 @@ fn next_proposal_id(env: &Env) -> u64 {
         .storage()
         .instance()
         .get(&RescueKey::ProposalCounter)
-        .unwrap_or(0)
+        .unwrap_or(0_u64)
         .saturating_add(1);
     env.storage()
         .instance()
@@ -162,7 +161,7 @@ pub fn initialize_signers(env: &Env, signers: Vec<Address>) -> Result<(), Error>
     let mut signer_bytes: Vec<Bytes> = Vec::new(env);
     for i in 0..signers.len() {
         let addr = signers.get(i).unwrap();
-        signer_bytes.push_back(addr.to_xdr(env));
+        signer_bytes.push_back(addr.clone().to_xdr(env));
     }
     env.storage()
         .instance()
@@ -233,11 +232,13 @@ pub fn approve_rescue(env: &Env, signer: Address, proposal_id: u64) -> Result<()
         return Err(Error::ProposalNotPending);
     }
 
-    let signer_bytes = signer.to_xdr(env);
+    // Issue #336: Optimized duplicate approval check
+    // Convert signer to Bytes once for comparison
+    let signer_bytes = signer.clone().to_xdr(env);
     for i in 0..proposal.approvals.len() {
         let existing_approver = proposal.approvals.get(i).unwrap();
-        if existing_approver.to_xdr(env) == signer_bytes {
-            return Err(Error::AlreadyApproved);
+        if existing_approver.clone().to_xdr(env) == signer_bytes {
+            panic!("already approved");
         }
     }
 
@@ -294,7 +295,7 @@ pub fn execute_rescue(env: &Env, caller: Address, proposal_id: u64) -> Result<(A
     
     // Log gas buffer usage for monitoring
     env.events().publish(
-        (symbol_short!("gas_buffer"), proposal_id),
+        (symbol_short!("gasbuf"), proposal_id),
         (required_buffer, current_gas),
     );
 

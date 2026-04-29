@@ -9,7 +9,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{Address, Bytes, Env};
+    use soroban_sdk::{Address, Bytes, Env, String};
 
     #[test]
     fn test_storage_key_namespaces() {
@@ -83,6 +83,10 @@ mod tests {
             (StorageKey::TaxFlowHistory(Address::random()), "audit"),
             (StorageKey::ComplianceData, "audit"),
             (StorageKey::RegulatoryReport(101112), "audit"),
+            (StorageKey::ClaimValueCounter(1), "audit"),
+            (StorageKey::ClaimValue(1, 1), "audit"),
+            (StorageKey::Sep38DefaultFiat, "audit"),
+            (StorageKey::Sep38Rate(Address::random(), String::from_str(&Env::default(), "USD")), "audit"),
             
             (StorageKey::WrappedAsset(Address::random()), "multi_token"),
             (StorageKey::BridgeConfig, "multi_token"),
@@ -107,6 +111,7 @@ mod tests {
             (StorageKey::FeatureFlag(Bytes::from_slice(&[7, 8, 9])), "misc"),
             (StorageKey::TemporaryData(Bytes::from_slice(&[10, 11, 12])), "misc"),
             (StorageKey::MigrationStatus, "misc"),
+            (StorageKey::ProtocolPauseReason, "misc"),
         ];
 
         for (key, expected_namespace) in test_cases {
@@ -131,6 +136,8 @@ mod tests {
             StorageKey::Proposal(456),
             StorageKey::LastOraclePrice,
             StorageKey::AuditTxCounter,
+            StorageKey::ClaimValue(1, 1),
+            StorageKey::Sep38DefaultFiat,
             StorageKey::WrappedAsset(Address::random()),
             StorageKey::EmergencySigners,
             StorageKey::ReentrancyGuard,
