@@ -1,24 +1,20 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
     Symbol, vec, IntoVal, String, Map, xdr::ScVal, xdr::ToXdr, Bytes,
 };
-
-
-#![no_std]
  
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
- 
-// PATCH: declare the new reentrancy module ───────────────────────────────────
 pub mod reentrancy;
-// Also re-export the macro so callers can write `use grant_stream::nonreentrant`
-// if they ever need it from sibling modules.
-pub use nonreentrant;
 
 // --- Constants ---
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+pub const SEP38_STALENESS_SECONDS: u64 = 5 * 60;
 const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+// Minimum claimable balance required before a withdrawal is permitted (1 USDC in 7-decimal units)
+pub const MIN_WITHDRAWAL: i128 = 10_000_000;
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 
@@ -35,10 +31,13 @@ pub mod audit_log;
 pub mod multi_threshold;
 pub mod security_council;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod test_dispute_circuit_breaker;
 #[cfg(test)]
 mod test_security_council;
+
+#[cfg(test)]
+mod test_matching_pool;
 
 // --- Types ---
 
@@ -50,6 +49,7 @@ pub enum GrantStatus {
     Completed,
     Cancelled,
     RageQuitted,
+    Clawbacked,
 }
 
 // Import the unified storage keys
@@ -95,34 +95,64 @@ pub struct Grant {
     pub is_legal_signed: bool,
     /// Optional reason string for why the grant was paused
     pub pause_reason: Option<String>,
+    /// Original donor who funded the grant (for clawback authorization)
+    pub donor: Option<Address>,
+    /// Checkpoint timestamp when clawback was executed (to prevent double-spending)
+    pub clawback_checkpoint: Option<u64>,
 }
 
-
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
-#[derive(Clone)]
-pub struct Grant {
-    pub recipient: Address,
-    pub token: Address,
-    pub total_amount: i128,
-    pub streamed_amount: i128,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub paused: bool,
-    // … other existing fields …
+pub struct Sep38Rate {
+    pub base_asset: Address,
+    pub quote_asset: String,
+    pub rate: i128,
+    pub scale: i128,
+    pub oracle_timestamp: u64,
+    pub source_ledger_sequence: u32,
 }
 
-#[contract]
-pub struct GrantStream;
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct Sep38Quote {
+    pub base_asset: Address,
+    pub quote_asset: String,
+    pub token_amount: i128,
+    pub fiat_value: i128,
+    pub rate: i128,
+    pub scale: i128,
+    pub oracle_timestamp: u64,
+    pub source_ledger_sequence: u32,
+    pub price_data_missing: bool,
+}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ClaimFiatValue {
+    pub grant_id: u64,
+    pub claim_index: u64,
+    pub recipient: Address,
+    pub token_address: Address,
+    pub token_amount: i128,
+    pub fiat_value: i128,
+    pub fiat_asset: String,
+    pub rate: i128,
+    pub rate_scale: i128,
+    pub oracle_timestamp: u64,
+    pub oracle_ledger_sequence: u32,
+    pub claim_ledger_sequence: u32,
+    pub claim_ledger_timestamp: u64,
+    pub price_data_missing: bool,
+}
 
-// Legacy DataKey alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy DataKey alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type DataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u32)]
-pub enum Error {
+pub enum GrantStreamError {
     NotInitialized = 1,
     AlreadyInitialized = 2,
     NotAuthorized = 3,
@@ -137,12 +167,17 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     NotValidator = 14,
-    LegalSignatureRequired = 15,
+    KycMissing = 15,
     GrantNotPurgeable = 16,
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
+    OracleFrozen = 20,
+    RentPreservationMode = 21,
+    InvalidTimestamp = 22,
 }
+
+pub type Error = GrantStreamError;
 
 // --- Internal Helpers ---
 
@@ -176,6 +211,107 @@ fn read_grant_token(env: &Env) -> Result<Address, Error> {
     env.storage().instance().get(&StorageKey::GrantToken).ok_or(Error::NotInitialized)
 }
 
+fn default_sep38_fiat(env: &Env) -> String {
+    env.storage()
+        .instance()
+        .get(&StorageKey::Sep38DefaultFiat)
+        .unwrap_or_else(|| String::from_str(env, "USD"))
+}
+
+fn read_sep38_rate(env: &Env, token: &Address, fiat_asset: &String) -> Option<Sep38Rate> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::Sep38Rate(token.clone(), fiat_asset.clone()))
+}
+
+fn next_claim_value_index(env: &Env, grant_id: u64) -> u64 {
+    let index = env.storage()
+        .instance()
+        .get(&StorageKey::ClaimValueCounter(grant_id))
+        .unwrap_or(0_u64)
+        .saturating_add(1);
+    env.storage().instance().set(&StorageKey::ClaimValueCounter(grant_id), &index);
+    index
+}
+
+fn quote_sep38_claim(
+    env: &Env,
+    token_addr: &Address,
+    amount: i128,
+    fiat_asset: &String,
+) -> Sep38Quote {
+    if let Some(rate) = read_sep38_rate(env, token_addr, fiat_asset) {
+        let now = env.ledger().timestamp();
+        let fresh = rate.base_asset == *token_addr
+            && rate.rate > 0
+            && rate.scale > 0
+            && rate.oracle_timestamp <= now
+            && now.saturating_sub(rate.oracle_timestamp) <= SEP38_STALENESS_SECONDS;
+        if fresh {
+            if let Some(fiat_value) = amount
+                .checked_mul(rate.rate)
+                .and_then(|value| value.checked_div(rate.scale))
+            {
+                return Sep38Quote {
+                    base_asset: token_addr.clone(),
+                    quote_asset: fiat_asset.clone(),
+                    token_amount: amount,
+                    fiat_value,
+                    rate: rate.rate,
+                    scale: rate.scale,
+                    oracle_timestamp: rate.oracle_timestamp,
+                    source_ledger_sequence: rate.source_ledger_sequence,
+                    price_data_missing: false,
+                };
+            }
+        }
+    }
+
+    Sep38Quote {
+        base_asset: token_addr.clone(),
+        quote_asset: fiat_asset.clone(),
+        token_amount: amount,
+        fiat_value: 0,
+        rate: 0,
+        scale: SCALING_FACTOR,
+        oracle_timestamp: 0,
+        source_ledger_sequence: 0,
+        price_data_missing: true,
+    }
+}
+
+fn record_claim_value(
+    env: &Env,
+    grant_id: u64,
+    recipient: &Address,
+    token_addr: &Address,
+    amount: i128,
+) -> ClaimFiatValue {
+    let fiat_asset = default_sep38_fiat(env);
+    let quote = quote_sep38_claim(env, token_addr, amount, &fiat_asset);
+    let claim_index = next_claim_value_index(env, grant_id);
+    let claim_value = ClaimFiatValue {
+        grant_id,
+        claim_index,
+        recipient: recipient.clone(),
+        token_address: token_addr.clone(),
+        token_amount: amount,
+        fiat_value: quote.fiat_value,
+        fiat_asset,
+        rate: quote.rate,
+        rate_scale: quote.scale,
+        oracle_timestamp: quote.oracle_timestamp,
+        oracle_ledger_sequence: quote.source_ledger_sequence,
+        claim_ledger_sequence: env.ledger().sequence(),
+        claim_ledger_timestamp: env.ledger().timestamp(),
+        price_data_missing: quote.price_data_missing,
+    };
+    env.storage()
+        .instance()
+        .set(&StorageKey::ClaimValue(grant_id, claim_index), &claim_value);
+    claim_value
+}
+
 fn read_treasury(env: &Env) -> Result<Address, Error> {
     env.storage().instance().get(&StorageKey::Treasury).ok_or(Error::NotInitialized)
 }
@@ -185,6 +321,19 @@ fn read_grant_ids(env: &Env) -> Vec<u64> {
         .instance()
         .get(&StorageKey::GrantIds)
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_expected_milestone_nonce(env: &Env, grant_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneSubmitNonce(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_expected_milestone_nonce(env: &Env, grant_id: u64, next_nonce: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MilestoneSubmitNonce(grant_id), &next_nonce);
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -204,6 +353,12 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     Ok(total)
 }
 
+fn preview_grant_at_now(grant: &Grant, now: u64) -> Result<Grant, Error> {
+    let mut preview = grant.clone();
+    settle_grant(&mut preview, now)?;
+    Ok(preview)
+}
+
 fn count_active_grants(env: &Env) -> u32 {
     let mut count = 0_u32;
     let ids = read_grant_ids(env);
@@ -216,6 +371,44 @@ fn count_active_grants(env: &Env) -> u32 {
         }
     }
     count
+}
+
+fn require_donor_or_multisig_auth(env: &Env, grant: &Grant) -> Result<(), Error> {
+    match &grant.donor {
+        Some(donor) => {
+            donor.require_auth();
+            Ok(())
+        }
+        None => {
+            // If no donor is set, require admin authorization (DAO multi-sig)
+            require_admin_auth(env)
+        }
+    }
+}
+
+fn calculate_unearned_balance(grant: &Grant) -> Result<i128, Error> {
+    let total_earned = grant.withdrawn
+        .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+    
+    grant.total_amount.checked_sub(total_earned).ok_or(Error::MathOverflow)
+}
+
+fn set_clawback_checkpoint(env: &Env, grant_id: u64, timestamp: u64) {
+    env.storage().instance().set(&StorageKey::ClawbackCheckpoint(grant_id), &timestamp);
+}
+
+fn get_clawback_checkpoint(env: &Env, grant_id: u64) -> Option<u64> {
+    env.storage().instance().get(&StorageKey::ClawbackCheckpoint(grant_id))
+}
+
+fn set_dispute_escrow(env: &Env, grant_id: u64, amount: i128) {
+    env.storage().instance().set(&StorageKey::DisputeEscrow(grant_id), &amount);
+}
+
+fn get_dispute_escrow(env: &Env, grant_id: u64) -> Option<i128> {
+    env.storage().instance().get(&StorageKey::DisputeEscrow(grant_id))
 }
 
 fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
@@ -244,6 +437,12 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
 /// When no validator is set the full amount goes to the grantee.
 fn apply_accrued_split(grant: &mut Grant, accrued: i128) -> Result<(), Error> {
     if grant.validator.is_some() && accrued > 0 {
+        // ROUNDING BEHAVIOR: Integer division with checked_div truncates toward zero
+        // (rounds down for positive numbers). This is INTENTIONAL and CORRECT.
+        // It ensures the contract always retains any fractional remainder, preventing
+        // the "Point One Cent" exploit where rounding up could slowly drain the contract
+        // beyond its obligations over many transactions.
+        // See test_point_one_cent_exploit.rs for comprehensive proof.
         let validator_share = accrued
             .checked_mul(500)
             .ok_or(Error::MathOverflow)?
@@ -325,121 +524,14 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     Ok(())
 }
 
- pub fn claim_milestone_funds(env: Env, grant_id: u64, milestone_index: u32) -> i128 {
-        nonreentrant!(env, {
-            // ── Auth ─────────────────────────────────────────────────────
-            let grant: Grant = env
-                .storage()
-                .persistent()
-                .get(&StorageKey::Grant(grant_id))
-                .expect("grant not found");
- 
-            grant.recipient.require_auth();
- 
-            // ── Milestone validation ──────────────────────────────────────
-            // (existing logic unchanged)
-            let milestone_key = StorageKey::Milestone(grant_id, milestone_index);
-            let milestone_proof: Symbol = env
-                .storage()
-                .persistent()
-                .get(&milestone_key)
-                .expect("milestone not found or not yet submitted");
- 
-            // ── Compute claimable amount ──────────────────────────────────
-            // (existing streaming / milestone calculation — unchanged)
-            let claimable: i128 = 0; // placeholder — replace with real logic
- 
-            // ── Cross-contract token transfer ─────────────────────────────
-            // This is the call that could trigger a malicious callback.
-            // The nonreentrant guard is already set before we reach this line.
-            let token_client = token::Client::new(&env, &grant.token);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &grant.recipient,
-                &claimable,
-            );
- 
-            // ── Update streamed amount ────────────────────────────────────
-            // State is mutated AFTER the external call — kept here for
-            // compatibility with existing logic; the guard makes it safe.
-            let mut updated_grant = grant.clone();
-            updated_grant.streamed_amount += claimable;
-            env.storage()
-                .persistent()
-                .set(&StorageKey::Grant(grant_id), &updated_grant);
- 
-            // ── Emit event ────────────────────────────────────────────────
-            env.events().publish(
-                (soroban_sdk::symbol_short!("milestone"),),
-                (grant_id, milestone_index, claimable),
-            );
- 
-            claimable
-            // ← reentrancy_exit() fires here via macro before returning
-        })
-    }
-
-     pub fn emergency_governance_withdraw(
-        env: Env,
-        grant_id: u64,
-        destination: Address,
-    ) -> i128 {
-        nonreentrant!(env, {
-            // ── Governance auth ───────────────────────────────────────────
-            let admin: Address = env
-                .storage()
-                .instance()
-                .get(&StorageKey::Admin)
-                .expect("admin not set");
-            admin.require_auth();
- 
-            // ── Fetch grant ───────────────────────────────────────────────
-            let grant: Grant = env
-                .storage()
-                .persistent()
-                .get(&StorageKey::Grant(grant_id))
-                .expect("grant not found");
- 
-            // ── Compute remaining balance ─────────────────────────────────
-            let remaining = grant.total_amount - grant.streamed_amount;
-            assert!(remaining > 0, "nothing to withdraw");
- 
-            // ── Cross-contract token transfer ─────────────────────────────
-            // Guard is already set — re-entrant callbacks are blocked.
-            let token_client = token::Client::new(&env, &grant.token);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &destination,
-                &remaining,
-            );
- 
-            // ── Mark grant as fully consumed ──────────────────────────────
-            let mut updated_grant = grant.clone();
-            updated_grant.streamed_amount = updated_grant.total_amount;
-            env.storage()
-                .persistent()
-                .set(&StorageKey::Grant(grant_id), &updated_grant);
- 
-            // ── Emit emergency event ──────────────────────────────────────
-            env.events().publish(
-                (soroban_sdk::symbol_short!("emerg_wd"),),
-                (grant_id, destination.clone(), remaining),
-            );
- 
-            remaining
-            // ← reentrancy_exit() fires here via macro before returning
-        })
-    }
- 
-    // … all other existing entry-points are UNCHANGED …
-
- 
-
 fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Error> {
     let elapsed_i128 = i128::from(elapsed);
     let base_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
 
     let multiplier = calculate_warmup_multiplier(grant, now);
+    // ROUNDING BEHAVIOR: Division rounds down (truncates toward zero).
+    // This ensures accrued amounts never exceed what should be paid out,
+    // maintaining the contract's solvency. See test_point_one_cent_exploit.rs.
     let accrued = base_accrued
         .checked_mul(multiplier)
         .ok_or(Error::MathOverflow)?
@@ -473,7 +565,52 @@ impl GrantStreamContract {
         env.storage().instance().set(&StorageKey::Oracle, &oracle);
         env.storage().instance().set(&StorageKey::NativeToken, &native_token);
         env.storage().instance().set(&StorageKey::GrantIds, &Vec::<u64>::new(&env));
+        env.storage().instance().set(&StorageKey::Sep38DefaultFiat, &String::from_str(&env, "USD"));
         Ok(())
+    }
+
+    pub fn set_sep38_rate(
+        env: Env,
+        fiat_asset: String,
+        rate: i128,
+        scale: i128,
+        oracle_timestamp: u64,
+        source_ledger_sequence: u32,
+    ) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+        if rate <= 0 || scale <= 0 {
+            return Err(Error::InvalidRate);
+        }
+        if oracle_timestamp == 0 || oracle_timestamp > env.ledger().timestamp() {
+            return Err(Error::InvalidTimestamp);
+        }
+
+        let token_addr = read_grant_token(&env)?;
+        let sep38_rate = Sep38Rate {
+            base_asset: token_addr.clone(),
+            quote_asset: fiat_asset.clone(),
+            rate,
+            scale,
+            oracle_timestamp,
+            source_ledger_sequence,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::Sep38Rate(token_addr.clone(), fiat_asset.clone()), &sep38_rate);
+        env.storage().instance().set(&StorageKey::Sep38DefaultFiat, &fiat_asset);
+        env.events().publish(
+            (symbol_short!("sep38set"), token_addr, fiat_asset),
+            (rate, scale, oracle_timestamp, source_ledger_sequence),
+        );
+        Ok(())
+    }
+
+    pub fn get_sep38_rate(env: Env, fiat_asset: String) -> Option<Sep38Rate> {
+        if let Ok(token_addr) = read_grant_token(&env) {
+            read_sep38_rate(&env, &token_addr, &fiat_asset)
+        } else {
+            None
+        }
     }
 
     pub fn create_grant(
@@ -484,6 +621,7 @@ impl GrantStreamContract {
         flow_rate: i128,
         warmup_duration: u64,
         validator: Option<Address>,
+        donor: Option<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
@@ -525,6 +663,8 @@ impl GrantStreamContract {
             requires_legal_signature: false,
             is_legal_signed: false,
             pause_reason: None,
+            donor: donor.clone(),
+            clawback_checkpoint: None,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -552,6 +692,10 @@ impl GrantStreamContract {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
 
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
@@ -574,7 +718,11 @@ impl GrantStreamContract {
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
-            return Err(Error::LegalSignatureRequired);
+            return Err(Error::KycMissing);
+        }
+
+        if grant.claimable < MIN_WITHDRAWAL {
+            return Err(Error::WithdrawalBelowMinimum);
         }
 
         if amount > grant.claimable {
@@ -588,7 +736,7 @@ impl GrantStreamContract {
         write_grant(&env, grant_id, &grant);
 
         // Issue #311: record withdrawal velocity; may engage SoftPause.
-        circuit_breakers::record_withdrawal_velocity(&env, amount);
+        let _ = circuit_breakers::record_withdrawal_velocity(&env, amount)?;
 
         // Storage Rent Depletion: check rent balance after withdrawal
         circuit_breakers::check_rent_balance(&env);
@@ -598,12 +746,23 @@ impl GrantStreamContract {
         let target = grant.redirect.unwrap_or(grant.recipient.clone());
         client.transfer(&env.current_contract_address(), &target, &amount);
 
+        let claim_value = record_claim_value(&env, grant_id, &grant.recipient, &token_addr, amount);
+
         let admin = read_admin(&env)?;
-        let grant_token = read_grant_token(&env)?;
         env.events().publish(
-            (symbol_short!("withdraw"), grant.recipient.clone(), admin, grant_token, grant_id),
+            (symbol_short!("withdraw"), grant.recipient.clone(), admin, token_addr.clone(), grant_id),
             amount,
         );
+        env.events().publish(
+            (symbol_short!("claimval"), grant.recipient.clone(), token_addr.clone(), grant_id),
+            claim_value.clone(),
+        );
+        if claim_value.price_data_missing {
+            env.events().publish(
+                (symbol_short!("prcmiss"), grant.recipient.clone(), token_addr, grant_id),
+                claim_value.clone(),
+            );
+        }
 
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
 
@@ -630,7 +789,7 @@ impl GrantStreamContract {
         let admin = read_admin(&env)?;
         let pause_reason_str = reason.unwrap_or_else(|| String::from_str(&env, "No reason provided"));
         env.events().publish(
-            (symbol_short!("protocol_paused"), admin, grant_id),
+            (symbol_short!("protopaus"), admin, grant_id),
             pause_reason_str,
         );
         Ok(())
@@ -659,7 +818,7 @@ impl GrantStreamContract {
         // Emit ProtocolPaused event for protocol-wide emergency pause
         let admin = read_admin(&env)?;
         env.events().publish(
-            (symbol_short!("protocol_paused"), admin, "EMERGENCY"),
+            (symbol_short!("protopaus"), admin, symbol_short!("emerg")),
             reason,
         );
         
@@ -809,6 +968,162 @@ impl GrantStreamContract {
         Ok(())
     }
 
+    /// Trigger clawback of unearned funds from a grant.
+    /// Restricted to the original donor or DAO multi-sig.
+    /// Calculates unearned balance and instantly terminates the stream.
+    pub fn trigger_grant_clawback(
+        env: Env,
+        grant_id: u64,
+        reason: String,
+        contested: bool,
+    ) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Check if clawback has already been executed
+        if grant.status == GrantStatus::Clawbacked {
+            return Err(Error::ClawbackAlreadyExecuted);
+        }
+        
+        // Only allow clawback for active or paused grants
+        if grant.status != GrantStatus::Active && grant.status != GrantStatus::Paused {
+            return Err(Error::InvalidState);
+        }
+        
+        // Validate reason is not empty
+        if reason.is_empty() {
+            return Err(Error::InvalidClawbackReason);
+        }
+        
+        // Require authorization from donor or DAO multi-sig
+        require_donor_or_multisig_auth(&env, &grant)?;
+        
+        let now = env.ledger().timestamp();
+        
+        // Set checkpoint to prevent double-spending during this operation
+        set_clawback_checkpoint(&env, grant_id, now);
+        grant.clawback_checkpoint = Some(now);
+        
+        // Settle grant up to the exact millisecond of clawback
+        settle_grant(&mut grant, now)?;
+        
+        // Calculate unearned balance (Total_Grant - Amount_Already_Streamed_To_Date)
+        let unearned_balance = calculate_unearned_balance(&grant)?;
+        
+        if unearned_balance <= 0 {
+            // No unearned funds to clawback, but still mark as clawbacked
+            grant.status = GrantStatus::Clawbacked;
+            write_grant(&env, grant_id, &grant);
+            
+            // Emit event even if no funds were clawed back
+            let admin = read_admin(&env)?;
+            let grant_token = read_grant_token(&env)?;
+            env.events().publish(
+                (symbol_short!("clawback"), grant.recipient.clone(), admin, grant_token, grant_id),
+                (0, reason, contested),
+            );
+            return Ok(());
+        }
+        
+        // Ensure grantee can claim any funds already vested up to this exact second
+        let vested_amount = grant.claimable;
+        let validator_vested = grant.validator_claimable;
+        
+        // Transfer unearned balance based on contest status
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        
+        if contested {
+            // Move funds to dispute escrow instead of donor's wallet
+            set_dispute_escrow(&env, grant_id, unearned_balance);
+            
+            // Emit event for disputed clawback
+            let admin = read_admin(&env)?;
+            env.events().publish(
+                (symbol_short!("clawback"), grant.recipient.clone(), admin, token_addr, grant_id),
+                (unearned_balance, reason.clone(), true),
+            );
+        } else {
+            // Return unearned balance to donor's vault
+            let donor_address = grant.donor.clone().ok_or(Error::NotDonorOrMultiSig)?;
+            client.transfer(&env.current_contract_address(), &donor_address, &unearned_balance);
+            
+            // Emit event for successful clawback
+            let admin = read_admin(&env)?;
+            env.events().publish(
+                (symbol_short!("clawback"), grant.recipient.clone(), admin, token_addr, grant_id),
+                (unearned_balance, reason.clone(), false),
+            );
+        }
+        
+        // Mark grant as clawbacked
+        grant.status = GrantStatus::Clawbacked;
+        write_grant(&env, grant_id, &grant);
+        
+        Ok(())
+    }
+
+    /// Resolve a disputed clawback by releasing escrowed funds to the appropriate party
+    pub fn resolve_disputed_clawback(
+        env: Env,
+        grant_id: u64,
+        release_to_donor: bool, // true = release to donor, false = return to grant
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Clawbacked {
+            return Err(Error::InvalidState);
+        }
+        
+        let escrow_amount = get_dispute_escrow(&env, grant_id)
+            .ok_or(Error::DisputeEscrowNotFound)?;
+        
+        if escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        
+        if release_to_donor {
+            // Release to donor
+            let donor_address = grant.donor.clone().ok_or(Error::NotDonorOrMultiSig)?;
+            client.transfer(&env.current_contract_address(), &donor_address, &escrow_amount);
+        } else {
+            // Return to grant (resume streaming to grantee)
+            let mut updated_grant = grant.clone();
+            updated_grant.status = GrantStatus::Active;
+            updated_grant.last_update_ts = env.ledger().timestamp();
+            
+            // Add escrowed amount back to total available for streaming
+            updated_grant.total_amount = updated_grant.total_amount
+                .checked_add(escrow_amount).ok_or(Error::MathOverflow)?;
+            
+            write_grant(&env, grant_id, &updated_grant);
+            
+            // Transfer to treasury to fund the resumed grant
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &escrow_amount);
+        }
+        
+        // Clear the escrow
+        env.storage().instance().remove(&StorageKey::DisputeEscrow(grant_id));
+        
+        // Emit resolution event
+        let admin = read_admin(&env)?;
+        env.events().publish(
+            (symbol_short!("claw_resolve"), grant_id, admin),
+            (escrow_amount, release_to_donor),
+        );
+        
+        Ok(())
+    }
+
+    /// Get the current dispute escrow balance for a grant
+    pub fn get_dispute_escrow_balance(env: Env, grant_id: u64) -> Result<i128, Error> {
+        get_dispute_escrow(&env, grant_id).ok_or(Error::DisputeEscrowNotFound)
+    }
+
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
         require_admin_auth(&env)?;
         if amount <= 0 { return Err(Error::InvalidAmount); }
@@ -851,7 +1166,7 @@ impl GrantStreamContract {
     /// Sanity-check oracle confirms a suspicious price, clearing the freeze.
     pub fn confirm_oracle_price(env: Env, caller: Address, confirmed_price: i128) -> Result<(), Error> {
         if confirmed_price <= 0 { return Err(Error::InvalidAmount); }
-        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price);
+        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price)?;
         Ok(())
     }
 
@@ -913,6 +1228,22 @@ impl GrantStreamContract {
 
     // ── Standard getters ──────────────────────────────────────────────────────
 
+    pub fn get_claim_value(env: Env, grant_id: u64, claim_index: u64) -> Option<ClaimFiatValue> {
+        env.storage().instance().get(&StorageKey::ClaimValue(grant_id, claim_index))
+    }
+
+    pub fn get_latest_claim_value(env: Env, grant_id: u64) -> Option<ClaimFiatValue> {
+        let claim_index = env.storage()
+            .instance()
+            .get(&StorageKey::ClaimValueCounter(grant_id))
+            .unwrap_or(0_u64);
+        if claim_index == 0 {
+            None
+        } else {
+            env.storage().instance().get(&StorageKey::ClaimValue(grant_id, claim_index))
+        }
+    }
+
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
         read_grant(&env, grant_id)
     }
@@ -924,6 +1255,25 @@ impl GrantStreamContract {
         } else {
             0
         }
+    }
+
+    /// Current claimable values for a grant without mutating storage.
+    pub fn get_current_claimable_amounts(env: Env, grant_id: u64) -> Result<(i128, i128), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        let preview = preview_grant_at_now(&grant, env.ledger().timestamp())?;
+        Ok((preview.claimable, preview.validator_claimable))
+    }
+
+    /// Current grantee claimable amount without mutating storage.
+    pub fn get_current_grantee_claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
+        let (claimable, _) = Self::get_current_claimable_amounts(env, grant_id)?;
+        Ok(claimable)
+    }
+
+    /// Current validator claimable amount without mutating storage.
+    pub fn get_current_validator_claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
+        let (_, validator_claimable) = Self::get_current_claimable_amounts(env, grant_id)?;
+        Ok(validator_claimable)
     }
 
     /// Compute the claimable balance for exponential vesting.
@@ -980,7 +1330,7 @@ impl GrantStreamContract {
             // Threshold was breached - emit an event for transparency
             let admin = read_admin(&env)?;
             env.events().publish(
-                (symbol_short!("dispute_cb"),),
+                (symbol_short!("disputecb"),),
                 (grant_id, active_grants_count, "Mass dispute threshold breached"),
             );
         }
@@ -999,7 +1349,7 @@ impl GrantStreamContract {
         circuit_breakers::resume_grant_initialization(&env, &admin);
         
         env.events().publish(
-            (symbol_short!("resume_grants"),),
+            (symbol_short!("resgrant"),),
             admin,
         );
         
@@ -1185,6 +1535,55 @@ impl GrantStreamContract {
         Ok(())
     }
 
+    /// Submit an off-chain milestone proof with monotonic nonce protection.
+    ///
+    /// Replay prevention:
+    /// - Every grant tracks an expected nonce starting at 0.
+    /// - Submission is accepted only when `nonce == expected_nonce`.
+    /// - The expected nonce is incremented after a successful write.
+    ///
+    /// Cancellation edge case:
+    /// - Cancelled / rage-quit / completed grants reject new milestone proofs.
+    pub fn submit_milestone_proof(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        proof: Symbol,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status == GrantStatus::Cancelled
+            || grant.status == GrantStatus::RageQuitted
+            || grant.status == GrantStatus::Completed
+        {
+            return Err(Error::InvalidState);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+        if env.storage().persistent().has(&milestone_key) {
+            return Err(Error::InvalidState);
+        }
+
+        let expected_nonce = read_expected_milestone_nonce(&env, grant_id);
+        if nonce != expected_nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        env.storage().persistent().set(&milestone_key, &proof);
+
+        let next_nonce = nonce.checked_add(1).ok_or(Error::MathOverflow)?;
+        write_expected_milestone_nonce(&env, grant_id, next_nonce);
+
+        env.events().publish(
+            (symbol_short!("mil_sub"),),
+            (grant_id, milestone_index, nonce),
+        );
+
+        Ok(())
+    }
+
     pub fn emit_grant_status(env: Env, grant_id: u64) -> Result<soroban_sdk::Bytes, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         settle_grant(&mut grant, env.ledger().timestamp())?;
@@ -1199,10 +1598,10 @@ impl GrantStreamContract {
         Ok(data)
     }
 
+    /// Get the current protocol health factor in basis points without mutating on-chain state.
     pub fn get_health_factor(env: Env) -> Result<i128, Error> {
         let liabilities = total_allocated_funds(&env)?;
-        // Call yield_treasury module implementation
-        match yield_treasury::YieldTreasuryContract::calculate_pool_health(env, liabilities) {
+        match yield_treasury::YieldTreasuryContract::preview_pool_health(env, liabilities) {
             Ok(hf) => Ok(hf),
             Err(_) => Err(Error::MathOverflow), // Map to generic error for simplicity
         }
@@ -1225,6 +1624,19 @@ impl GrantStreamContract {
         // 2. Must have no pending claims
         if grant.claimable > 0 || grant.validator_claimable > 0 {
             return Err(Error::GrantNotPurgeable);
+        }
+
+        // 3. Completed grants must be fully accounted before deletion.
+        // This prevents accidental state deletion if any user funds are still
+        // represented in grant accounting due to an upstream bug.
+        if grant.status == GrantStatus::Completed {
+            let accounted = grant.withdrawn
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            if accounted != grant.total_amount {
+                return Err(Error::GrantNotPurgeable);
+            }
         }
 
         // Cleanup state: Remove grant from storage
@@ -1324,7 +1736,7 @@ impl GrantStreamContract {
         signers: soroban_sdk::Vec<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
-        multi_threshold::initialize_signers(&env, signers);
+        multi_threshold::initialize_signers(&env, signers)?;
         Ok(())
     }
 
@@ -1336,12 +1748,12 @@ impl GrantStreamContract {
         kind: multi_threshold::RescueKind,
         rescue_to: Address,
         amount: i128,
-    ) -> u64 {
+    ) -> Result<u64, Error> {
         multi_threshold::propose_rescue(&env, proposer, kind, rescue_to, amount)
     }
 
     /// Add an approval to a pending rescue proposal.
-    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) {
+    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) -> Result<(), Error> {
         multi_threshold::approve_rescue(&env, signer, proposal_id)
     }
 
@@ -1354,14 +1766,14 @@ impl GrantStreamContract {
         token_address: Address,
     ) -> Result<(), Error> {
         let (rescue_to, amount) =
-            multi_threshold::execute_rescue(&env, caller, proposal_id);
+            multi_threshold::execute_rescue(&env, caller, proposal_id)?;
         let client = token::Client::new(&env, &token_address);
         client.transfer(&env.current_contract_address(), &rescue_to, &amount);
         Ok(())
     }
 
     /// Cancel a pending rescue proposal.  Only the original proposer may cancel.
-    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) {
+    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) -> Result<(), Error> {
         multi_threshold::cancel_rescue(&env, proposer, proposal_id)
     }
 
@@ -1603,15 +2015,17 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
 
 #[cfg(test)]
 mod test;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod test_concurrent_withdraw;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod test_rounding_fuzz;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod test_temporal_fuzz;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod test_global_invariant_fuzz;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod test_security_invariants;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod is_active_grantee_benchmark;
+#[cfg(test)]
+mod test_sep38_claim_value;

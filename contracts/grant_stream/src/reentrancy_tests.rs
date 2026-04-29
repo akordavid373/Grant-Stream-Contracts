@@ -75,12 +75,19 @@ fn test_enter_exit_enter_succeeds_after_release() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic]
 fn test_double_enter_panics() {
     let env = fresh_env();
     reentrancy_enter(&env);
     // Simulates a re-entrant callback attempting to enter the same guard
-    reentrancy_enter(&env); // must panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reentrancy_enter(&env);
+    }));
+
+    assert!(result.is_err(), "second enter must fail");
+    if let Err(payload) = result {
+        let code = payload.downcast_ref::<u32>();
+        assert_eq!(code, Some(&REENTRANT_ERROR_CODE));
+    }
 }
 
 #[test]
@@ -186,16 +193,23 @@ fn test_macro_sequential_calls_succeed() {
 }
 
 #[test]
-#[should_panic]
 fn test_macro_nested_call_panics() {
     let env = fresh_env();
 
-    crate::nonreentrant!(env, {
-        // Simulate a re-entrant callback invoking another guarded path
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::nonreentrant!(env, {
-            // should never reach here
+            // Simulate a re-entrant callback invoking another guarded path
+            crate::nonreentrant!(env, {
+                // should never reach here
+            });
         });
-    });
+    }));
+
+    assert!(result.is_err(), "nested nonreentrant macro call must fail");
+    if let Err(payload) = result {
+        let code = payload.downcast_ref::<u32>();
+        assert_eq!(code, Some(&REENTRANT_ERROR_CODE));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@
 /// If the balance falls below a 3-month rent buffer, non-essential functions are disabled
 /// to preserve funds for storage maintenance.
 
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, token, Address, Env};
 use crate::storage_keys::StorageKey;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -47,8 +47,8 @@ const RENT_BUFFER_XLM: i128 = MONTHLY_RENT_XLM * RENT_BUFFER_MONTHS as i128; // 
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
-// Legacy CircuitBreakerKey type alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy CircuitBreakerKey type alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type CircuitBreakerKey = StorageKey;
 
 // ── Oracle Price Guard (Issue #312) ───────────────────────────────────────────
@@ -97,14 +97,14 @@ pub fn record_oracle_price(env: &Env, new_price: i128) -> bool {
 
 /// Called by the sanity-check oracle to confirm a suspicious price after the
 /// guard has been tripped.  Clears the freeze and stores the confirmed price.
-pub fn confirm_oracle_price(env: &Env, caller: &Address, confirmed_price: i128) {
+pub fn confirm_oracle_price(env: &Env, caller: &Address, confirmed_price: i128) -> Result<(), Error> {
     let sanity_oracle: Address = env
         .storage()
         .instance()
         .get(&StorageKey::SanityOracle)
-        .expect("SanityOracle not configured");
+        .ok_or(Error::NotSanityOracle)?;
     if *caller != sanity_oracle {
-        panic!("confirm_oracle_price: caller is not the sanity oracle");
+        return Err(Error::NotSanityOracle);
     }
     caller.require_auth();
 
@@ -114,6 +114,7 @@ pub fn confirm_oracle_price(env: &Env, caller: &Address, confirmed_price: i128) 
     env.storage()
         .instance()
         .set(&StorageKey::OracleFrozen, &false);
+    Ok(())
 }
 
 /// Returns `true` when the oracle price circuit breaker is active (frozen).
@@ -203,10 +204,12 @@ pub fn update_tvl_snapshot(env: &Env, total_liquidity: i128) {
 ///
 /// Panics if the contract is already in SoftPause — callers must check
 /// `is_soft_paused` before calling this.
-pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> bool {
+pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> Result<bool, Error> {
     if is_soft_paused(env) {
-        panic!("Contract is in SoftPause — admin verification required");
+        return Err(Error::SoftPaused);
     }
+
+    assert!(amount > 0, "record_withdrawal_velocity: amount must be positive");
 
     let now: u64 = env.ledger().timestamp();
     let window_start: u64 = env
@@ -398,4 +401,36 @@ pub fn get_dispute_monitoring_stats(env: &Env) -> (u64, u32, u32, bool) {
     let halted: bool = is_grant_initialization_halted(env);
 
     (window_start, dispute_count, active_grants_snapshot, halted)
+}
+
+pub fn get_rent_buffer_threshold(_env: &Env) -> i128 {
+    RENT_BUFFER_XLM
+}
+
+pub fn get_current_xlm_balance(env: &Env) -> i128 {
+    if let Some(native_token) = env.storage().instance().get::<_, Address>(&StorageKey::NativeToken) {
+        let client = token::Client::new(env, &native_token);
+        client.balance(&env.current_contract_address())
+    } else {
+        0
+    }
+}
+
+pub fn is_rent_preservation_mode(env: &Env) -> bool {
+    env.storage().instance().get(&StorageKey::RentPreservationMode).unwrap_or(false)
+}
+
+pub fn check_rent_balance(env: &Env) -> bool {
+    let below_threshold = get_current_xlm_balance(env) < RENT_BUFFER_XLM;
+    env.storage().instance().set(&StorageKey::RentPreservationMode, &below_threshold);
+    below_threshold
+}
+
+pub fn is_function_allowed(env: &Env, essential: bool) -> bool {
+    essential || !is_rent_preservation_mode(env)
+}
+
+pub fn disable_rent_preservation_mode(env: &Env, admin: &Address) {
+    admin.require_auth();
+    env.storage().instance().set(&StorageKey::RentPreservationMode, &false);
 }

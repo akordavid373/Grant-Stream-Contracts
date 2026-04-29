@@ -17,7 +17,7 @@
 //   one ledger write.
 // ============================================================================
 
-use soroban_sdk::{contracttype, panic_with_error, Env};
+use soroban_sdk::{contracttype, panic_with_error, Env, xdr::{ScErrorCode, ScErrorType}};
 
 // ---------------------------------------------------------------------------
 // Storage key
@@ -76,7 +76,8 @@ pub fn reentrancy_enter(env: &Env) {
 
     // Check ──────────────────────────────────────────────────────────────────
     if storage.has(&GuardKey::NonReentrant) {
-        panic_with_error!(env, REENTRANT_ERROR_CODE);
+        let _ = REENTRANT_ERROR_CODE;
+        panic_with_error!(env, (ScErrorType::Context, ScErrorCode::InvalidAction));
     }
 
     // Lock ───────────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
 };
 
 use super::optimized::{
@@ -82,7 +82,7 @@ impl GrantContract {
         
         // Refund remaining balance to admin
         if remaining_balance > 0 {
-            SelfTerminateResult::refund_to_admin(&env, remaining_balance)?;
+            SelfTerminateResult::refund_to_admin(&env, &grant, remaining_balance)?;
         }
         
         // Update grant status
@@ -198,11 +198,10 @@ impl SelfTerminateResult {
         if amount <= 0 {
             return Ok(()); // No transfer needed
         }
-        
-        // In a real implementation, this would transfer tokens
-        // For now, we'll simulate the transfer
-        // TODO: Implement actual token transfer logic
-        
+
+        let token_client = token::Client::new(env, &grant.token);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
         env.events().publish(
             (symbol_short!("grnt_setl"), grant.recipient.clone()),
             (amount, "Final claimable amount settled"),
@@ -212,16 +211,14 @@ impl SelfTerminateResult {
     }
     
     /// Refund remaining balance to admin
-    fn refund_to_admin(env: &Env, amount: i128) -> Result<(), Error> {
+    fn refund_to_admin(env: &Env, grant: &Grant, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Ok(()); // No refund needed
         }
         
         let admin = read_admin(env)?;
-        
-        // In a real implementation, this would transfer tokens to admin
-        // For now, we'll simulate the transfer
-        // TODO: Implement actual token transfer logic
+        let token_client = token::Client::new(env, &grant.token);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
         
         env.events().publish(
             (symbol_short!("adm_refnd"), admin),
