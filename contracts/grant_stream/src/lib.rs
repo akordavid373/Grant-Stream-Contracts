@@ -19,6 +19,8 @@ pub use nonreentrant;
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
 const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+// Minimum claimable balance required before a withdrawal is permitted (1 USDC in 7-decimal units)
+pub const MIN_WITHDRAWAL: i128 = 10_000_000;
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 
@@ -139,6 +141,7 @@ pub enum Error {
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
+    WithdrawalBelowMinimum = 20,
 }
 
 // --- Internal Helpers ---
@@ -572,6 +575,10 @@ impl GrantStreamContract {
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
             return Err(Error::LegalSignatureRequired);
+        }
+
+        if grant.claimable < MIN_WITHDRAWAL {
+            return Err(Error::WithdrawalBelowMinimum);
         }
 
         if amount > grant.claimable {

@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, SCALING_FACTOR};
+use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, Error, SCALING_FACTOR, MIN_WITHDRAWAL};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env,
@@ -302,4 +302,64 @@ fn test_validator_split_basic() {
     set_timestamp(&env, 1100);
     assert_eq!(client.claimable(&grant_id), 95 * SCALING_FACTOR);
     assert_eq!(client.validator_claimable(&grant_id), 5 * SCALING_FACTOR);
+}
+
+#[test]
+fn test_withdraw_below_minimum_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    // Flow rate: 0.5 USDC/sec — claimable after 1 sec is 0.5 USDC < 1 USDC minimum
+    let flow_rate = SCALING_FACTOR / 2;
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0, &None);
+
+    set_timestamp(&env, 1001); // only 0.5 USDC accrued
+    let result = client.try_withdraw(&grant_id, &flow_rate);
+    assert_eq!(result, Err(Ok(Error::WithdrawalBelowMinimum)));
+}
+
+#[test]
+fn test_withdraw_at_minimum_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    // Flow rate: 1 USDC/sec — claimable after 1 sec is exactly 1 USDC
+    let flow_rate = MIN_WITHDRAWAL;
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0, &None);
+
+    set_timestamp(&env, 1001); // exactly MIN_WITHDRAWAL accrued
+    client.withdraw(&grant_id, &MIN_WITHDRAWAL);
+}
+
+#[test]
+fn test_withdraw_above_minimum_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    let flow_rate = 5 * SCALING_FACTOR; // 5 USDC/sec
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0, &None);
+
+    set_timestamp(&env, 1010); // 50 USDC accrued >> minimum
+    client.withdraw(&grant_id, &(50 * SCALING_FACTOR));
 }
