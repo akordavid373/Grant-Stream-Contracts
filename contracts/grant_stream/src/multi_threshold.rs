@@ -12,6 +12,7 @@
 ///
 /// Issue #336: Optimized signature verification and gas buffer for complex multi-sig transactions
 
+use crate::Error;
 use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec};
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
@@ -148,8 +149,11 @@ fn next_proposal_id(env: &Env) -> u64 {
 /// Register the signer set.  Must be called once during contract setup.
 /// `signers` must contain exactly `EMERGENCY_SIGNERS` (10) addresses.
 /// Issue #336: Also stores pre-serialized Bytes for optimized verification
-pub fn initialize_signers(env: &Env, signers: Vec<Address>) {
-    // Store original addresses for compatibility
+pub fn initialize_signers(env: &Env, signers: Vec<Address>) -> Result<(), Error> {
+    if signers.len() != EMERGENCY_SIGNERS {
+        return Err(Error::InvalidAmount);
+    }
+
     env.storage()
         .instance()
         .set(&RescueKey::Signers, &signers);
@@ -163,6 +167,7 @@ pub fn initialize_signers(env: &Env, signers: Vec<Address>) {
     env.storage()
         .instance()
         .set(&RescueKey::SignerBytes, &signer_bytes);
+    Ok(())
 }
 
 /// Open a new rescue proposal.  The caller must be a registered signer.
@@ -173,10 +178,14 @@ pub fn propose_rescue(
     kind: RescueKind,
     rescue_to: Address,
     amount: i128,
-) -> u64 {
+) -> Result<u64, Error> {
     proposer.require_auth();
-    assert!(is_signer(env, &proposer), "not a registered signer");
-    assert!(amount > 0, "amount must be positive");
+    if !is_signer(env, &proposer) {
+        return Err(Error::NotRegisteredSigner);
+    }
+    if amount <= 0 {
+        return Err(Error::InvalidAmount);
+    }
 
     let id = next_proposal_id(env);
     let mut approvals: Vec<Address> = Vec::new(env);
@@ -202,34 +211,33 @@ pub fn propose_rescue(
         (id, kind, rescue_to, amount),
     );
 
-    id
+    Ok(id)
 }
 
 /// Add an approval to an existing pending proposal.
 /// The caller must be a registered signer who has not already approved.
 /// Issue #336: Optimized duplicate approval check using Set-like logic
-pub fn approve_rescue(env: &Env, signer: Address, proposal_id: u64) {
+pub fn approve_rescue(env: &Env, signer: Address, proposal_id: u64) -> Result<(), Error> {
     signer.require_auth();
-    assert!(is_signer(env, &signer), "not a registered signer");
+    if !is_signer(env, &signer) {
+        return Err(Error::NotRegisteredSigner);
+    }
 
     let mut proposal: RescueProposal = env
         .storage()
         .instance()
         .get(&RescueKey::Proposal(proposal_id))
-        .expect("proposal not found");
+        .ok_or(Error::ProposalNotFound)?;
 
-    assert!(
-        proposal.status == RescueStatus::Pending,
-        "proposal not pending"
-    );
+    if proposal.status != RescueStatus::Pending {
+        return Err(Error::ProposalNotPending);
+    }
 
-    // Issue #336: Optimized duplicate approval check
-    // Convert signer to Bytes once for comparison
     let signer_bytes = signer.to_xdr(env);
     for i in 0..proposal.approvals.len() {
         let existing_approver = proposal.approvals.get(i).unwrap();
         if existing_approver.to_xdr(env) == signer_bytes {
-            panic!("already approved");
+            return Err(Error::AlreadyApproved);
         }
     }
 
@@ -243,6 +251,7 @@ pub fn approve_rescue(env: &Env, signer: Address, proposal_id: u64) {
         (symbol_short!("rescappr"), signer),
         (proposal_id, proposal.approvals.len()),
     );
+    Ok(())
 }
 
 /// Execute a rescue proposal once the required threshold is met.
@@ -252,26 +261,26 @@ pub fn approve_rescue(env: &Env, signer: Address, proposal_id: u64) {
 /// delegated to the contract caller via the returned amount – the
 /// contract's `rescue_funds` entry-point should perform the transfer.
 /// Issue #336: Enhanced with gas buffer management for critical operations
-pub fn execute_rescue(env: &Env, caller: Address, proposal_id: u64) -> (Address, i128) {
+pub fn execute_rescue(env: &Env, caller: Address, proposal_id: u64) -> Result<(Address, i128), Error> {
     caller.require_auth();
-    assert!(is_signer(env, &caller), "not a registered signer");
+    if !is_signer(env, &caller) {
+        return Err(Error::NotRegisteredSigner);
+    }
 
     let mut proposal: RescueProposal = env
         .storage()
         .instance()
         .get(&RescueKey::Proposal(proposal_id))
-        .expect("proposal not found");
+        .ok_or(Error::ProposalNotFound)?;
 
-    assert!(
-        proposal.status == RescueStatus::Pending,
-        "proposal not pending"
-    );
+    if proposal.status != RescueStatus::Pending {
+        return Err(Error::ProposalNotPending);
+    }
 
     let required = threshold_for(proposal.kind);
-    assert!(
-        proposal.approvals.len() >= required,
-        "insufficient approvals"
-    );
+    if proposal.approvals.len() < required {
+        return Err(Error::InsufficientApprovals);
+    }
 
     // Issue #336: Ensure gas buffer for critical operations
     let gas_buffer = get_gas_buffer(env);
@@ -303,20 +312,21 @@ pub fn execute_rescue(env: &Env, caller: Address, proposal_id: u64) -> (Address,
 }
 
 /// Cancel a pending proposal.  Only the original proposer may cancel.
-pub fn cancel_rescue(env: &Env, proposer: Address, proposal_id: u64) {
+pub fn cancel_rescue(env: &Env, proposer: Address, proposal_id: u64) -> Result<(), Error> {
     proposer.require_auth();
 
     let mut proposal: RescueProposal = env
         .storage()
         .instance()
         .get(&RescueKey::Proposal(proposal_id))
-        .expect("proposal not found");
+        .ok_or(Error::ProposalNotFound)?;
 
-    assert!(proposal.proposer == proposer, "not the proposer");
-    assert!(
-        proposal.status == RescueStatus::Pending,
-        "proposal not pending"
-    );
+    if proposal.proposer != proposer {
+        return Err(Error::NotAuthorized);
+    }
+    if proposal.status != RescueStatus::Pending {
+        return Err(Error::ProposalNotPending);
+    }
 
     proposal.status = RescueStatus::Cancelled;
     env.storage()
@@ -327,6 +337,7 @@ pub fn cancel_rescue(env: &Env, proposer: Address, proposal_id: u64) {
         (symbol_short!("resccanc"), proposer),
         proposal_id,
     );
+    Ok(())
 }
 
 /// Return a proposal by id.
