@@ -4,7 +4,7 @@ use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, SCALING
 use std::println;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env, Symbol,
+    token, Address, Bytes, Env, Symbol, xdr::ToXdr,
 };
 
 fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantStreamContractClient) {
@@ -26,6 +26,27 @@ fn set_timestamp(env: &Env, timestamp: u64) {
     env.ledger().with_mut(|li| {
         li.timestamp = timestamp;
     });
+}
+
+fn build_confidential_proof(
+    env: &Env,
+    grant_id: u64,
+    commitment_before: i128,
+    claim_amount: i128,
+    nullifier: &Bytes,
+    verifier_key_hash: &Bytes,
+) -> Bytes {
+    let commitment_after = commitment_before - claim_amount;
+    let mut public_inputs = Bytes::new(env);
+    for byte in grant_id.to_be_bytes() {
+        public_inputs.push_back(byte);
+    }
+    public_inputs.append(&commitment_before.to_xdr(env));
+    public_inputs.append(&commitment_after.to_xdr(env));
+    public_inputs.append(&claim_amount.to_xdr(env));
+    public_inputs.append(nullifier);
+    public_inputs.append(verifier_key_hash);
+    env.crypto().sha256(&public_inputs).into()
 }
 
 #[test]
@@ -293,6 +314,7 @@ fn test_is_active_grantee_archived_data() {
     // Test with user who had grants but all are now completed/cancelled
     // This simulates the "stale records" edge case
 }
+
 #[test]
 fn test_warmup() {
     let env = Env::default();
@@ -435,4 +457,86 @@ fn test_withdraw_above_minimum_succeeds() {
 
     set_timestamp(&env, 1010); // 50 USDC accrued >> minimum
     client.withdraw(&grant_id, &(50 * SCALING_FACTOR));
+}
+
+#[test]
+fn test_confidential_claim_executes_with_valid_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token = token::Client::new(&env, &grant_token_addr);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+    let grant_id = 501u64;
+    let commitment_before = 1_000_000i128;
+    let claim_amount = 10_000i128;
+    let nullifier = Bytes::from_array(&env, &[1; 32]);
+    let verifier_key_hash = Bytes::from_array(&env, &[7; 32]);
+
+    grant_token_admin.mint(&client.address, &1_000_000i128);
+    client.create_confidential_grant(
+        &grant_id,
+        &recipient,
+        &commitment_before,
+        &verifier_key_hash,
+    );
+
+    let proof = build_confidential_proof(
+        &env,
+        grant_id,
+        commitment_before,
+        claim_amount,
+        &nullifier,
+        &verifier_key_hash,
+    );
+    let recipient_before = grant_token.balance(&recipient);
+    client.confidential_claim(&grant_id, &claim_amount, &nullifier, &proof);
+    let recipient_after = grant_token.balance(&recipient);
+    assert_eq!(recipient_after, recipient_before + claim_amount);
+}
+
+#[test]
+fn test_confidential_claim_invalid_proof_fuzz_barrage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+    let grant_id = 502u64;
+    let commitment_before = 50_000i128;
+    let verifier_key_hash = Bytes::from_array(&env, &[9; 32]);
+
+    grant_token_admin.mint(&client.address, &1_000_000i128);
+    client.create_confidential_grant(
+        &grant_id,
+        &recipient,
+        &commitment_before,
+        &verifier_key_hash,
+    );
+
+    for i in 0..128u32 {
+        let mut bad_nullifier = Bytes::new(&env);
+        bad_nullifier.append(&Bytes::from_array(&env, &[0; 31]));
+        bad_nullifier.push_back((i % 255) as u8);
+        let mut bad_proof = Bytes::new(&env);
+        bad_proof.append(&Bytes::from_array(&env, &[3; 31]));
+        bad_proof.push_back((i % 251) as u8);
+        let bad_claim = commitment_before + 1 + i as i128;
+        let result = client.try_confidential_claim(&grant_id, &bad_claim, &bad_nullifier, &bad_proof);
+        assert_eq!(result, Err(Ok(super::Error::InvalidZKProof)));
+    }
+
+    let nullifier = Bytes::from_array(&env, &[5; 32]);
+    let claim_amount = 1_000i128;
+    let proof = build_confidential_proof(
+        &env,
+        grant_id,
+        commitment_before,
+        claim_amount,
+        &nullifier,
+        &verifier_key_hash,
+    );
+    client.confidential_claim(&grant_id, &claim_amount, &nullifier, &proof);
+    let replay = client.try_confidential_claim(&grant_id, &claim_amount, &nullifier, &proof);
+    assert_eq!(replay, Err(Ok(super::Error::InvalidZKProof)));
 }
