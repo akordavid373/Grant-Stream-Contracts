@@ -74,8 +74,8 @@ pub struct VotingPower {
     pub last_updated: u64,
 }
 
-// Legacy GovernanceDataKey type alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy GovernanceDataKey type alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type GovernanceDataKey = StorageKey;
 
 #[contracterror]

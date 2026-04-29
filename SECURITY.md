@@ -23,6 +23,7 @@ This document provides comprehensive security information for the Grant Stream C
 The Grant Stream protocol implements multiple security layers:
 
 - **Access Control**: Role-based permissions with admin, oracle, and recipient roles
+- **Double-Approval System**: Dual authorization for high-value milestone payouts
 - **Reentrancy Protection**: Manual guards preventing recursive calls
 - **Circuit Breakers**: Oracle price deviation and TVL velocity limits
 - **Legal Compliance**: On-chain legal document signatures
@@ -65,6 +66,16 @@ The Grant Stream protocol implements multiple security layers:
 | `rescue_tokens` | `lib.rs:751` | Admin auth, allocation checks, balance validation | [AUDIT-004] |
 | `set_sanity_oracle` | `lib.rs:775` | Admin auth, oracle validation | [AUDIT-005] |
 | `update_tvl_snapshot` | `lib.rs:805` | Admin auth, liquidity validation | [AUDIT-006] |
+
+### Double-Approval Functions (High Risk)
+
+| Function | File | Security Requirements | Audit References |
+|----------|------|---------------------|------------------|
+| `initialize_double_approval` | `lib.rs:1424` | Admin auth, approver validation, threshold check | [AUDIT-014] |
+| `create_double_approval_request` | `lib.rs:1463` | Admin auth, threshold validation, amount check | [AUDIT-015] |
+| `approve_double_approval_request` | `lib.rs:1494` | Approver auth, duplicate prevention, expiration check | [AUDIT-016] |
+| `execute_double_approval_request` | `lib.rs:1505` | Executor auth, full approval check, expiration validation | [AUDIT-017] |
+| `cancel_double_approval_request` | `lib.rs:1516` | Admin auth, status validation, authorization check | [AUDIT-018] |
 
 ### Oracle Functions (Medium Risk)
 
@@ -114,6 +125,11 @@ The Grant Stream protocol implements multiple security layers:
 - **Likelihood**: Low
 - **Mitigations**: Multiple independent checks, admin overrides
 
+#### 5. Double-Approval System Bypass
+- **Impact**: Unauthorized high-value payouts, single point compromise
+- **Likelihood**: Low (requires dual compromise)
+- **Mitigations**: Separate approver roles, time windows, audit logging
+
 ### Medium-Severity Threats
 
 #### 1. Legal Compliance Bypass
@@ -146,6 +162,12 @@ The Grant Stream protocol implements multiple security layers:
 3. **Multi-Sig Recommendations**
    - Minimum 2-of-3 for admin operations
    - Separate keys for different functions
+
+4. **Double-Approval System**
+   - Dual authorization for high-value payouts
+   - Configurable value thresholds
+   - Time-based approval windows
+   - Separate approver roles (admin + oracle)
 
 ### Reentrancy Protection
 

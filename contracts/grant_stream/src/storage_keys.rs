@@ -16,11 +16,11 @@
 /// 9. **Emergency & Recovery** - Multi-signature rescue operations
 /// 10. **Reentrancy Protection** - Security guards against reentrancy attacks
 
-use soroban_sdk::{contracttype, Address, Bytes};
+use soroban_sdk::{contracttype, Address, Bytes, String};
 
 /// Unified storage key enum with namespaced categories to prevent collisions
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[contracttype]
+#[contracttype(export = false)]
 pub enum StorageKey {
     // ── Core Contract State ──────────────────────────────────────────────────────
     
@@ -45,6 +45,8 @@ pub enum StorageKey {
     Grant(u64),
     /// Grant milestone data keyed by (grant_id, milestone_index)
     Milestone(u64, u32),
+    /// Expected monotonic nonce for off-chain milestone proof submission
+    MilestoneSubmitNonce(u64),
     /// Grant streaming metadata and configuration
     GrantStreamConfig(u64),
     /// Grant legal compliance data (hashes, signatures)
@@ -55,6 +57,10 @@ pub enum StorageKey {
     GrantMetrics(u64),
     /// Grant dispute status and resolution data
     GrantDisputeData(u64),
+    /// Double-approval request for high-value milestone payouts
+    DoubleApprovalRequest(u64, u32),
+    /// Double-approval configuration and thresholds
+    DoubleApprovalConfig,
     
     // ── User Data ───────────────────────────────────────────────────────────────
     
@@ -87,6 +93,10 @@ pub enum StorageKey {
     YieldStrategy,
     /// Harvest schedule and automation data
     HarvestSchedule,
+    /// Yield treasury generic config
+    Config,
+    /// Yield treasury generic metrics
+    Metrics,
     
     // ── Governance ─────────────────────────────────────────────────────────────
     
@@ -166,6 +176,14 @@ pub enum StorageKey {
     ComplianceData,
     /// Regulatory reporting snapshots
     RegulatoryReport(u64),
+    /// Per-grant claim valuation counter
+    ClaimValueCounter(u64),
+    /// Ledger-linked fiat valuation for a specific claim
+    ClaimValue(u64, u64),
+    /// Default SEP-38 quote/fiat asset for grant token claims
+    Sep38DefaultFiat,
+    /// Latest SEP-38 rate keyed by (base token, quote/fiat asset)
+    Sep38Rate(Address, String),
     
     // ── Multi-Token Operations ─────────────────────────────────────────────────
     
@@ -198,6 +216,25 @@ pub enum StorageKey {
     /// Operation timeout tracking
     OperationTimeout(Bytes),
     
+    // ── Matching Pool (Quadratic Funding) ────────────────────────────────────
+    
+    /// Matching pool vault data keyed by pool ID
+    MatchingPool(u64),
+    /// Donation record keyed by (pool_id, project_id, donor_address)
+    Donation(u64, u64, Address),
+    /// Project contributions aggregate keyed by (pool_id, project_id)
+    ProjectContributions(u64, u64),
+    /// All donors in a pool keyed by pool_id
+    PoolDonors(u64),
+    /// All projects in a pool keyed by pool_id
+    PoolProjects(u64),
+    /// SEP-12 identity verification status keyed by address
+    Sep12Identity(Address),
+    /// Donation matched amount keyed by (pool_id, project_id)
+    ProjectMatched(u64, u64),
+    /// Pool matching round metadata keyed by pool_id
+    MatchingRound(u64),
+    
     // ── Public Dashboard & Monitoring ──────────────────────────────────────────
     
     /// Last heartbeat timestamp for monitoring
@@ -219,6 +256,8 @@ pub enum StorageKey {
     TemporaryData(Bytes),
     /// Migration status for contract upgrades
     MigrationStatus,
+    /// Protocol-wide pause reason
+    ProtocolPauseReason,
 }
 
 impl StorageKey {
@@ -238,11 +277,14 @@ impl StorageKey {
             // Grant Management
             StorageKey::Grant(_)
             | StorageKey::Milestone(_, _)
+            | StorageKey::MilestoneSubmitNonce(_)
             | StorageKey::GrantStreamConfig(_)
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
             | StorageKey::GrantMetrics(_)
-            | StorageKey::GrantDisputeData(_) => "grant",
+            | StorageKey::GrantDisputeData(_)
+            | StorageKey::DoubleApprovalRequest(_, _)
+            | StorageKey::DoubleApprovalConfig => "grant",
             
             // User Data
             StorageKey::RecipientGrants(_)
@@ -259,7 +301,9 @@ impl StorageKey {
             | StorageKey::ReserveBalance
             | StorageKey::YieldToken
             | StorageKey::YieldStrategy
-            | StorageKey::HarvestSchedule => "treasury",
+            | StorageKey::HarvestSchedule
+            | StorageKey::Config
+            | StorageKey::Metrics => "treasury",
             
             // Governance
             StorageKey::Proposal(_)
@@ -300,7 +344,11 @@ impl StorageKey {
             | StorageKey::AuditLogEntry(_)
             | StorageKey::TaxFlowHistory(_)
             | StorageKey::ComplianceData
-            | StorageKey::RegulatoryReport(_) => "audit",
+            | StorageKey::RegulatoryReport(_)
+            | StorageKey::ClaimValueCounter(_)
+            | StorageKey::ClaimValue(_, _)
+            | StorageKey::Sep38DefaultFiat
+            | StorageKey::Sep38Rate(_, _) => "audit",
             
             // Multi-Token
             StorageKey::WrappedAsset(_)
@@ -319,6 +367,16 @@ impl StorageKey {
             | StorageKey::FunctionReentrancyLock(_)
             | StorageKey::OperationTimeout(_) => "security",
             
+            // Matching Pool
+            StorageKey::MatchingPool(_)
+            | StorageKey::Donation(_, _, _)
+            | StorageKey::ProjectContributions(_, _)
+            | StorageKey::PoolDonors(_)
+            | StorageKey::PoolProjects(_)
+            | StorageKey::Sep12Identity(_)
+            | StorageKey::ProjectMatched(_, _)
+            | StorageKey::MatchingRound(_) => "matching_pool",
+            
             // Dashboard & Monitoring
             StorageKey::LastHeartbeat
             | StorageKey::LastTvl
@@ -329,7 +387,8 @@ impl StorageKey {
             StorageKey::ContractVersion
             | StorageKey::FeatureFlag(_)
             | StorageKey::TemporaryData(_)
-            | StorageKey::MigrationStatus => "misc",
+            | StorageKey::MigrationStatus
+            | StorageKey::ProtocolPauseReason => "misc",
         }
     }
     
@@ -351,6 +410,8 @@ impl StorageKey {
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
             StorageKey::GrantMetrics(_) => "Grant performance metrics",
             StorageKey::GrantDisputeData(_) => "Grant dispute status",
+            StorageKey::DoubleApprovalRequest(_, _) => "Double-approval request for milestone",
+            StorageKey::DoubleApprovalConfig => "Double-approval configuration",
             
             StorageKey::RecipientGrants(_) => "Grants associated with recipient",
             StorageKey::UserBalance(_) => "User balance information",
@@ -366,6 +427,8 @@ impl StorageKey {
             StorageKey::YieldToken => "Token used for yield farming",
             StorageKey::YieldStrategy => "Yield farming strategy config",
             StorageKey::HarvestSchedule => "Automated harvest schedule",
+            StorageKey::Config => "Yield treasury generic configuration",
+            StorageKey::Metrics => "Yield treasury generic metrics",
             
             StorageKey::Proposal(_) => "Governance proposal data",
             StorageKey::Vote(_, _) => "Individual vote records",
@@ -404,6 +467,10 @@ impl StorageKey {
             StorageKey::TaxFlowHistory(_) => "User tax flow history",
             StorageKey::ComplianceData => "Compliance monitoring data",
             StorageKey::RegulatoryReport(_) => "Regulatory report snapshot",
+            StorageKey::ClaimValueCounter(_) => "Per-grant claim valuation counter",
+            StorageKey::ClaimValue(_, _) => "Ledger-linked claim fiat valuation",
+            StorageKey::Sep38DefaultFiat => "Default SEP-38 fiat quote asset",
+            StorageKey::Sep38Rate(_, _) => "SEP-38 grant-token fiat rate",
             
             StorageKey::WrappedAsset(_) => "Wrapped asset data",
             StorageKey::BridgeConfig => "Multi-token bridge config",
@@ -419,6 +486,15 @@ impl StorageKey {
             StorageKey::FunctionReentrancyLock(_) => "Function-specific lock",
             StorageKey::OperationTimeout(_) => "Operation timeout tracking",
             
+            StorageKey::MatchingPool(_) => "Matching pool vault data",
+            StorageKey::Donation(_, _, _) => "Individual donation record",
+            StorageKey::ProjectContributions(_, _) => "Project contribution aggregate",
+            StorageKey::PoolDonors(_) => "All donors in matching pool",
+            StorageKey::PoolProjects(_) => "All projects in matching pool",
+            StorageKey::Sep12Identity(_) => "SEP-12 identity verification status",
+            StorageKey::ProjectMatched(_, _) => "Project matched amount",
+            StorageKey::MatchingRound(_) => "Matching round metadata",
+            
             StorageKey::LastHeartbeat => "Last monitoring heartbeat",
             StorageKey::LastTvl => "Last TVL snapshot",
             StorageKey::DashboardConfig => "Dashboard configuration",
@@ -428,6 +504,7 @@ impl StorageKey {
             StorageKey::FeatureFlag(_) => "Feature flag configuration",
             StorageKey::TemporaryData(_) => "Temporary storage data",
             StorageKey::MigrationStatus => "Contract migration status",
+            StorageKey::ProtocolPauseReason => "Protocol-wide emergency pause reason",
         }
     }
 }
@@ -435,17 +512,22 @@ impl StorageKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn address() -> Address {
+        Address::generate(&soroban_sdk::Env::default())
+    }
 
     #[test]
     fn test_storage_key_namespace() {
         assert_eq!(StorageKey::Admin.namespace(), "core");
         assert_eq!(StorageKey::Grant(123).namespace(), "grant");
-        assert_eq!(StorageKey::RecipientGrants(Address::random()).namespace(), "user");
+        assert_eq!(StorageKey::RecipientGrants(address()).namespace(), "user");
         assert_eq!(StorageKey::TreasuryConfig.namespace(), "treasury");
         assert_eq!(StorageKey::Proposal(456).namespace(), "governance");
         assert_eq!(StorageKey::OracleFrozen.namespace(), "circuit_breaker");
         assert_eq!(StorageKey::AuditTxCounter.namespace(), "audit");
-        assert_eq!(StorageKey::WrappedAsset(Address::random()).namespace(), "multi_token");
+        assert_eq!(StorageKey::WrappedAsset(address()).namespace(), "multi_token");
         assert_eq!(StorageKey::EmergencySigners.namespace(), "emergency");
         assert_eq!(StorageKey::ReentrancyGuard.namespace(), "security");
         assert_eq!(StorageKey::LastHeartbeat.namespace(), "monitoring");
@@ -456,6 +538,6 @@ mod tests {
     fn test_storage_key_description() {
         assert!(!StorageKey::Admin.description().is_empty());
         assert!(!StorageKey::Grant(123).description().is_empty());
-        assert!(!StorageKey::RecipientGrants(Address::random()).description().is_empty());
+        assert!(!StorageKey::RecipientGrants(address()).description().is_empty());
     }
 }
