@@ -13,6 +13,7 @@
 /// Issue #336: Optimized signature verification and gas buffer for complex multi-sig transactions
 
 use soroban_sdk::{symbol_short, Address, Bytes, Env, Vec, xdr::ToXdr};
+use crate::GrantStreamError as Error;
 
 // ── Thresholds ────────────────────────────────────────────────────────────────
 
