@@ -380,3 +380,81 @@ fn test_withdraw_above_minimum_succeeds() {
     set_timestamp(&env, 1010); // 50 USDC accrued >> minimum
     client.withdraw(&grant_id, &(50 * SCALING_FACTOR));
 }
+
+#[test]
+fn test_change_grantee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    let flow_rate = 1 * SCALING_FACTOR;
+    grant_token_admin.mint(&client.address, &total_amount);
+    
+    // Create grant with old recipient
+    client.create_grant(&grant_id, &old_recipient, &total_amount, &flow_rate, &0, &None);
+    
+    // Verify initial state
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.recipient, old_recipient);
+    
+    // Change grantee
+    client.change_grantee(&grant_id, &new_recipient);
+    
+    // Verify grantee changed
+    let updated_grant = client.get_grant(&grant_id);
+    assert_eq!(updated_grant.recipient, new_recipient);
+    assert_eq!(updated_grant.redirect, None); // Should be cleared
+    
+    // Test that new recipient can withdraw
+    set_timestamp(&env, 1100); // 100 tokens accrued
+    client.withdraw(&grant_id, &(100 * SCALING_FACTOR));
+    
+    // Verify tokens went to new recipient
+    let grant_token = token::Client::new(&env, &grant_token_addr);
+    assert_eq!(grant_token.balance(&new_recipient), 100 * SCALING_FACTOR);
+}
+
+#[test]
+fn test_change_grantee_same_recipient_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    
+    let grant_id = 1;
+    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &None);
+    
+    // Attempt to change to same recipient should fail
+    let result = client.try_change_grantee(&grant_id, &recipient);
+    assert_eq!(result, Err(Ok(Error::InvalidRecipient)));
+}
+
+#[test]
+fn test_change_grantee_completed_grant_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let old_recipient = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+    
+    let grant_id = 1;
+    let total_amount = 100 * SCALING_FACTOR;
+    grant_token_admin.mint(&client.address, &total_amount);
+    
+    client.create_grant(&grant_id, &old_recipient, &total_amount, &SCALING_FACTOR, &0, &None);
+    
+    // Complete the grant
+    set_timestamp(&env, 1100);
+    client.withdraw(&grant_id, &total_amount);
+    
+    // Attempt to change grantee of completed grant should fail
+    let result = client.try_change_grantee(&grant_id, &new_recipient);
+    assert_eq!(result, Err(Ok(Error::InvalidState)));
+}

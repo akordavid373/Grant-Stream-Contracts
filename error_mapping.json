@@ -28,6 +28,7 @@
     "26": "Milestone not ready",
     "27": "Funds are locked",
     "28": "Invalid signature",
-    "29": "Rent preservation mode active"
+    "29": "Rent preservation mode active",
+    "30": "Invalid recipient specified"
   }
 }

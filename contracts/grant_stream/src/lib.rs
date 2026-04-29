@@ -175,6 +175,7 @@ pub enum GrantStreamError {
     OracleFrozen = 20,
     RentPreservationMode = 21,
     InvalidTimestamp = 22,
+    InvalidRecipient = 30,
 }
 
 pub type Error = GrantStreamError;
@@ -965,6 +966,59 @@ impl GrantStreamContract {
             client.transfer(&env.current_contract_address(), &treasury, &remaining);
         }
 
+        Ok(())
+    }
+
+    /// Change the grantee (recipient) of an active grant.
+    /// This enables team migrations and grant transfers with proper authorization.
+    /// Requires admin authorization for security.
+    pub fn change_grantee(env: Env, grant_id: u64, new_grantee: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Only allow changing grantee for active or paused grants
+        if grant.status != GrantStatus::Active && grant.status != GrantStatus::Paused {
+            return Err(Error::InvalidState);
+        }
+        
+        // Prevent changing to the same grantee
+        if grant.recipient == new_grantee {
+            return Err(Error::InvalidRecipient);
+        }
+        
+        let old_grantee = grant.recipient.clone();
+        
+        // Update grant recipient
+        grant.recipient = new_grantee.clone();
+        
+        // Clear any existing redirect since we're changing the primary recipient
+        grant.redirect = None;
+        
+        write_grant(&env, grant_id, &grant);
+        
+        // Update storage mappings: remove from old grantee's grants
+        let old_recipient_key = StorageKey::RecipientGrants(old_grantee.clone());
+        let mut old_user_grants: Vec<u64> = env.storage().instance().get(&old_recipient_key).unwrap_or(vec![&env]);
+        if let Some(pos) = old_user_grants.iter().position(|&id| id == grant_id) {
+            old_user_grants.remove(pos);
+            env.storage().instance().set(&old_recipient_key, &old_user_grants);
+        }
+        
+        // Add to new grantee's grants
+        let new_recipient_key = StorageKey::RecipientGrants(new_grantee.clone());
+        let mut new_user_grants: Vec<u64> = env.storage().instance().get(&new_recipient_key).unwrap_or(vec![&env]);
+        new_user_grants.push_back(grant_id);
+        env.storage().instance().set(&new_recipient_key, &new_user_grants);
+        
+        // Emit event
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("grantee_chg"), old_grantee, new_grantee, admin, grant_token, grant_id),
+            grant.total_amount,
+        );
+        
         Ok(())
     }
 
