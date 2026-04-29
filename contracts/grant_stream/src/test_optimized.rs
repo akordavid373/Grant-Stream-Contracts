@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use soroban_sdk::{Address, testutils::{Ledger, LedgerInfo}};
-use super::optimized::{GrantContract, STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED};
+use super::optimized::{GrantContract, STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED, STATUS_MILESTONE_BASED};
 
 #[test]
 fn test_bitwise_status_operations() {
@@ -228,6 +228,87 @@ fn test_milestone_evidence_anchor_required() {
     GrantContract::set_milestone_deadline(&ledger, &contract_id, 2u64, 1_800_000_000).unwrap();
     let result = GrantContract::mark_milestone_met(&ledger, &contract_id, 2u64);
     assert!(result.is_err(), "milestone approval must fail after deadline reset without new evidence");
+}
+
+#[test]
+fn test_milestone_expiry_auto_cancels_abandoned_grant() {
+    let ledger_info = LedgerInfo {
+        protocol_version: 20,
+        sequence_number: 12345,
+        timestamp: 1_620_000_000,
+        network_id: 1,
+        base_reserve: 10,
+        min_persistent_entry_fee: 100,
+        min_temp_entry_fee: 100,
+    };
+
+    let ledger = Ledger::with_info(&ledger_info);
+    let admin = Address::from_public_key(&[21; 32]);
+    let recipient = Address::from_public_key(&[22; 32]);
+    let contract_id = ledger.contract_id();
+
+    GrantContract::initialize(&ledger, &contract_id, admin).unwrap();
+    GrantContract::create_grant(
+        &ledger,
+        &contract_id,
+        21u64,
+        recipient,
+        1000000i128,
+        100i128,
+        STATUS_ACTIVE | STATUS_MILESTONE_BASED,
+    )
+    .unwrap();
+    GrantContract::set_milestone_deadline(&ledger, &contract_id, 21u64, 1_610_000_000).unwrap();
+
+    let cancelled = GrantContract::process_milestone_expiry(&ledger, &contract_id, 21u64).unwrap();
+    assert!(cancelled, "expired unapproved milestone grant should auto-cancel");
+    assert!(GrantContract::is_grant_cancelled(&ledger, &contract_id, 21u64).unwrap());
+}
+
+#[test]
+fn test_milestone_expiry_does_not_cancel_when_met() {
+    let ledger_info = LedgerInfo {
+        protocol_version: 20,
+        sequence_number: 12345,
+        timestamp: 1_620_000_000,
+        network_id: 1,
+        base_reserve: 10,
+        min_persistent_entry_fee: 100,
+        min_temp_entry_fee: 100,
+    };
+
+    let ledger = Ledger::with_info(&ledger_info);
+    let admin = Address::from_public_key(&[31; 32]);
+    let recipient = Address::from_public_key(&[32; 32]);
+    let contract_id = ledger.contract_id();
+
+    GrantContract::initialize(&ledger, &contract_id, admin.clone()).unwrap();
+    GrantContract::create_grant(
+        &ledger,
+        &contract_id,
+        31u64,
+        recipient.clone(),
+        1000000i128,
+        100i128,
+        STATUS_ACTIVE | STATUS_MILESTONE_BASED,
+    )
+    .unwrap();
+    GrantContract::set_milestone_deadline(&ledger, &contract_id, 31u64, 1_610_000_000).unwrap();
+
+    ledger.set_source_account(&recipient);
+    GrantContract::submit_milestone_evidence(
+        &ledger,
+        &contract_id,
+        31u64,
+        "QmMetEvidence".to_string(),
+    )
+    .unwrap();
+    ledger.set_source_account(&admin);
+    GrantContract::mark_milestone_met(&ledger, &contract_id, 31u64).unwrap();
+
+    let cancelled = GrantContract::process_milestone_expiry(&ledger, &contract_id, 31u64).unwrap();
+    assert!(!cancelled, "met milestone must not auto-cancel");
+    assert!(!GrantContract::is_grant_cancelled(&ledger, &contract_id, 31u64).unwrap());
 }
 
 #[test]

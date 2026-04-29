@@ -115,6 +115,44 @@ fn clear_milestone_evidence(env: &Env, grant_id: u64) {
     env.storage().instance().remove(&DataKey::MilestoneEvidence(grant_id));
 }
 
+fn maybe_auto_cancel_milestone_expiry(
+    env: &Env,
+    grant_id: u64,
+    grant: &mut Grant,
+) -> Result<bool, Error> {
+    if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
+        return Ok(false);
+    }
+    if has_status(grant.status_mask, STATUS_CANCELLED)
+        || has_status(grant.status_mask, STATUS_COMPLETED)
+        || has_status(grant.status_mask, STATUS_RAGE_QUIT)
+    {
+        return Ok(false);
+    }
+
+    let now = env.ledger().timestamp();
+    if grant.milestone_deadline == 0 || now <= grant.milestone_deadline || grant.milestone_met {
+        return Ok(false);
+    }
+
+    let cancel_settle_ts = if grant.last_update_ts < grant.milestone_deadline {
+        grant.milestone_deadline
+    } else {
+        grant.last_update_ts
+    };
+    settle_grant(grant, cancel_settle_ts)?;
+    grant.status_mask = set_status(grant.status_mask, STATUS_CANCELLED);
+    grant.status_mask = clear_status(grant.status_mask, STATUS_ACTIVE);
+    grant.status_mask = clear_status(grant.status_mask, STATUS_PAUSED);
+    grant.flow_rate = 0;
+    write_grant(env, grant_id, grant);
+    env.events().publish(
+        (symbol_short!("milexpir"), grant_id),
+        (grant.milestone_deadline, cancel_settle_ts),
+    );
+    Ok(true)
+}
+
 pub fn validate_status_transition(current_mask: u32, new_mask: u32) -> Result<(), Error> {
     if has_status(current_mask, STATUS_COMPLETED) || has_status(current_mask, STATUS_CANCELLED) {
         return Err(Error::InvalidStatusTransition);
@@ -364,7 +402,8 @@ impl GrantContract {
     }
 
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
-        let grant = read_grant(&env, grant_id)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        let _ = maybe_auto_cancel_milestone_expiry(&env, grant_id, &mut grant)?;
         preview_grant_at_now(&env, &grant)
     }
 
@@ -398,7 +437,8 @@ impl GrantContract {
     }
 
     pub fn claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
-        let grant = read_grant(&env, grant_id)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        let _ = maybe_auto_cancel_milestone_expiry(&env, grant_id, &mut grant)?;
         let preview = preview_grant_at_now(&env, &grant)?;
         Ok(preview.claimable)
     }
@@ -409,6 +449,7 @@ impl GrantContract {
         }
 
         let mut grant = read_grant(&env, grant_id)?;
+        let _ = maybe_auto_cancel_milestone_expiry(&env, grant_id, &mut grant)?;
 
         // Can only withdraw from active grants
         if !has_status(grant.status_mask, STATUS_ACTIVE) {
@@ -444,6 +485,13 @@ impl GrantContract {
 
         write_grant(&env, grant_id, &grant);
         Ok(())
+    }
+
+    /// Auto-cancel milestone-based grants that missed deadline without approval.
+    /// Returns `true` when cancellation was applied, `false` otherwise.
+    pub fn process_milestone_expiry(env: Env, grant_id: u64) -> Result<bool, Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        maybe_auto_cancel_milestone_expiry(&env, grant_id, &mut grant)
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
