@@ -278,13 +278,13 @@ fn build_milestone_approval_payload(
 
 fn milestone_state(grant: &Grant) -> MilestoneConsensusState {
     MilestoneConsensusState {
-        evidence_hash: grant.milestone_evidence_hash.clone(),
-        threshold: grant.milestone_threshold,
-        dispute_window_secs: grant.milestone_dispute_window_secs,
-        dispute_window_end: grant.milestone_dispute_window_end,
-        oracles: grant.milestone_oracles.clone(),
-        approvers: grant.milestone_approvers.clone(),
-        is_completed: grant.milestone_met,
+        evidence_hash: Grant.milestone_evidence_hash.clone(),
+        threshold: Grant.milestone_threshold,
+        dispute_window_secs: Grant.milestone_dispute_window_secs,
+        dispute_window_end: Grant.milestone_dispute_window_end,
+        oracles: Grant.milestone_oracles.clone(),
+        approvers: Grant.milestone_approvers.clone(),
+        is_completed: Grant.milestone_met,
     }
 }
 

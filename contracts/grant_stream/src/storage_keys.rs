@@ -26,9 +26,9 @@ pub enum StorageKey {
     /// Contract administrator address with full permissions
     Admin,
     /// Primary token address used for grants (e.g., USDC)
-    GrantTok,
+    GrantToken,
     /// Native token address (e.g., XLM) for fees and bounties
-    NativeTok,
+    NativeToken,
     /// Treasury address for holding and managing funds
     Treasury,
     /// Oracle address for price feeds and external data
@@ -42,6 +42,8 @@ pub enum StorageKey {
     
     /// Individual grant data keyed by grant ID
     Grant(u64),
+    /// Lightweight cryptographic tombstone for pruned grants
+    Tombstone(u64),
     /// Grant milestone data keyed by (grant_id, milestone_index)
     Milestone(u64, u32),
     /// Expected monotonic nonce for off-chain milestone proof submission
@@ -333,6 +335,7 @@ impl Key {
             
             // Grant Management
             StorageKey::Grant(_)
+            | StorageKey::Tombstone(_)
             | StorageKey::Milestone(_, _)
             | StorageKey::MilestoneSubmitNonce(_)
             | StorageKey::ConfidentialGrantCommitment(_)
@@ -465,6 +468,7 @@ impl Key {
             StorageKey::ContractInitialized => "Contract initialization status",
             
             StorageKey::Grant(_) => "Individual grant data and metadata",
+            StorageKey::Tombstone(_) => "Cryptographic proof of a pruned grant",
             StorageKey::Milestone(_, _) => "Grant milestone information",
             StorageKey::MilestoneSubmitNonce(_) => "Expected nonce for milestone proof submission",
             StorageKey::ConfidentialGrantCommitment(_) => "Commitment for confidential grant amount",
