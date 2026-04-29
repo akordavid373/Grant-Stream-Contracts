@@ -33,9 +33,13 @@ pub mod public_dashboard;
 pub mod tax_reporting;
 pub mod audit_log;
 pub mod multi_threshold;
+pub mod matching_pool;
 
 #[cfg(test)]
 mod test_dispute_circuit_breaker;
+
+#[cfg(test)]
+mod test_matching_pool;
 
 // --- Types ---
 

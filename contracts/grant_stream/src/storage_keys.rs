@@ -198,6 +198,25 @@ pub enum StorageKey {
     /// Operation timeout tracking
     OperationTimeout(Bytes),
     
+    // ── Matching Pool (Quadratic Funding) ────────────────────────────────────
+    
+    /// Matching pool vault data keyed by pool ID
+    MatchingPool(u64),
+    /// Donation record keyed by (pool_id, project_id, donor_address)
+    Donation(u64, u64, Address),
+    /// Project contributions aggregate keyed by (pool_id, project_id)
+    ProjectContributions(u64, u64),
+    /// All donors in a pool keyed by pool_id
+    PoolDonors(u64),
+    /// All projects in a pool keyed by pool_id
+    PoolProjects(u64),
+    /// SEP-12 identity verification status keyed by address
+    Sep12Identity(Address),
+    /// Donation matched amount keyed by (pool_id, project_id)
+    ProjectMatched(u64, u64),
+    /// Pool matching round metadata keyed by pool_id
+    MatchingRound(u64),
+    
     // ── Public Dashboard & Monitoring ──────────────────────────────────────────
     
     /// Last heartbeat timestamp for monitoring
@@ -319,6 +338,16 @@ impl StorageKey {
             | StorageKey::FunctionReentrancyLock(_)
             | StorageKey::OperationTimeout(_) => "security",
             
+            // Matching Pool
+            StorageKey::MatchingPool(_)
+            | StorageKey::Donation(_, _, _)
+            | StorageKey::ProjectContributions(_, _)
+            | StorageKey::PoolDonors(_)
+            | StorageKey::PoolProjects(_)
+            | StorageKey::Sep12Identity(_)
+            | StorageKey::ProjectMatched(_, _)
+            | StorageKey::MatchingRound(_) => "matching_pool",
+            
             // Dashboard & Monitoring
             StorageKey::LastHeartbeat
             | StorageKey::LastTvl
@@ -418,6 +447,15 @@ impl StorageKey {
             StorageKey::ReentrancyGuard => "Global reentrancy guard",
             StorageKey::FunctionReentrancyLock(_) => "Function-specific lock",
             StorageKey::OperationTimeout(_) => "Operation timeout tracking",
+            
+            StorageKey::MatchingPool(_) => "Matching pool vault data",
+            StorageKey::Donation(_, _, _) => "Individual donation record",
+            StorageKey::ProjectContributions(_, _) => "Project contribution aggregate",
+            StorageKey::PoolDonors(_) => "All donors in matching pool",
+            StorageKey::PoolProjects(_) => "All projects in matching pool",
+            StorageKey::Sep12Identity(_) => "SEP-12 identity verification status",
+            StorageKey::ProjectMatched(_, _) => "Project matched amount",
+            StorageKey::MatchingRound(_) => "Matching round metadata",
             
             StorageKey::LastHeartbeat => "Last monitoring heartbeat",
             StorageKey::LastTvl => "Last TVL snapshot",
