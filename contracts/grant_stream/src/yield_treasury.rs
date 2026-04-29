@@ -406,7 +406,7 @@ impl YieldTreasuryContract {
         write_metrics(&env, &metrics);
         
         let admin = read_admin(&env)?;
-        let yield_token = env.storage().instance().get::<_, Address>(&DataStorageKey::YieldToken).unwrap();
+        let yield_token = env.storage().instance().get::<_, Address>(&StorageKey::YieldToken).unwrap();
         env.events().publish(
             (symbol_short!("yield_inv"), admin, yield_token, investment_strategy),
             (amount, apy),
@@ -510,7 +510,7 @@ impl YieldTreasuryContract {
         write_metrics(&env, &metrics);
         
         let admin = read_admin(&env)?;
-        let yield_token = env.storage().instance().get::<_, Address>(&DataStorageKey::YieldToken).unwrap();
+        let yield_token = env.storage().instance().get::<_, Address>(&StorageKey::YieldToken).unwrap();
         env.events().publish(
             (symbol_short!("yield_div"), admin, yield_token),
             (divest_amount, investment_return, yield_return),
@@ -700,7 +700,7 @@ impl YieldTreasuryContract {
         write_metrics(&env, &metrics);
         
         let admin = read_admin(&env)?;
-        let yield_token = env.storage().instance().get::<_, Address>(&DataStorageKey::YieldToken).unwrap();
+        let yield_token = env.storage().instance().get::<_, Address>(&StorageKey::YieldToken).unwrap();
         env.events().publish(
             (symbol_short!("harvest"), admin, yield_token),
             (actual_yield, position.current_value),
