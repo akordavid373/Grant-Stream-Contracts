@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, SCALING_FACTOR};
+use std::println;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env,
@@ -101,13 +102,13 @@ fn test_is_active_grantee_with_different_statuses() {
     assert!(client.is_active_grantee(&active_grantee), "Active grantee should return true");
     
     // Pause grant 2 (should still return true - paused is considered active)
-    client.pause_stream(&2u64);
+    client.pause_stream(&2u64, &None);
     assert!(client.is_active_grantee(&paused_grantee), "Paused grantee should return true");
     
     // Complete grant 3 (should return false)
     // For testing, we'll simulate completion by setting status directly
     // In production, this would happen through normal grant lifecycle
-    let grant = client.get_grant(&3u64).unwrap();
+    let grant = client.get_grant(&3u64);
     // Note: In real implementation, you'd need to use admin functions to complete grants
     
     // Cancel grant 4 (should return false)
@@ -115,7 +116,7 @@ fn test_is_active_grantee_with_different_statuses() {
     assert!(!client.is_active_grantee(&cancelled_grantee), "Cancelled grantee should return false");
     
     // Note: Rage quit requires grant to be paused first
-    client.pause_stream(&5u64);
+    client.pause_stream(&5u64, &None);
     client.rage_quit(&5u64);
     assert!(!client.is_active_grantee(&ragequit_grantee), "Rage quit grantee should return false");
 }
@@ -162,13 +163,13 @@ fn test_is_active_grantee_performance() {
     }
     
     // Measure CPU instructions for multiple calls
-    let before_cpu = env.budget().cpu_instruction_count();
+    let before_cpu = env.budget().cpu_instruction_cost();
     
     for _ in 0..100 {
         let _ = client.is_active_grantee(&test_user);
     }
     
-    let after_cpu = env.budget().cpu_instruction_count();
+    let after_cpu = env.budget().cpu_instruction_cost();
     let total_cpu = after_cpu - before_cpu;
     let avg_cpu_per_call = total_cpu / 100;
     
@@ -197,29 +198,6 @@ fn test_is_active_grantee_archived_data() {
     // Test with user who had grants but all are now completed/cancelled
     // This simulates the "stale records" edge case
 }
-
-    // 2. Advance time and check claimable
-    set_timestamp(&env, 1010); // 10 seconds later
-    assert_eq!(client.claimable(&grant_id), 10 * SCALING_FACTOR);
-
-    // 3. Withdraw
-    client.withdraw(&grant_id, &(5 * SCALING_FACTOR));
-    assert_eq!(grant_token.balance(&recipient), 5 * SCALING_FACTOR);
-    assert_eq!(client.claimable(&grant_id), 5 * SCALING_FACTOR);
-
-    // 4. Propose Rate Increase (Timelocked)
-    let new_rate = 2 * SCALING_FACTOR;
-    client.propose_rate_change(&grant_id, &new_rate);
-    
-    let grant = client.get_grant(&grant_id);
-    assert_eq!(grant.pending_rate, new_rate);
-    assert_eq!(grant.effective_timestamp, 1010 + 48 * 60 * 60);
-
-    // 5. Advance time past timelock
-    set_timestamp(&env, 1010 + 48 * 60 * 60 + 10);
-    assert_eq!(client.claimable(&grant_id), 172825 * SCALING_FACTOR);
-}
-
 #[test]
 fn test_warmup() {
     let env = Env::default();
@@ -255,7 +233,7 @@ fn test_rage_quit() {
     client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
     
     set_timestamp(&env, 1100); // 100 tokens accrued
-    client.pause_stream(&grant_id);
+    client.pause_stream(&grant_id, &None);
     
     client.rage_quit(&grant_id);
     

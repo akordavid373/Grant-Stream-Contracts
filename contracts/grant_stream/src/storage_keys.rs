@@ -16,11 +16,11 @@
 /// 9. **Emergency & Recovery** - Multi-signature rescue operations
 /// 10. **Reentrancy Protection** - Security guards against reentrancy attacks
 
-use soroban_sdk::{contracttype, Address, Bytes};
+use soroban_sdk::{contracttype, Address, Bytes, String};
 
 /// Unified storage key enum with namespaced categories to prevent collisions
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[contracttype]
+#[contracttype(export = false)]
 pub enum StorageKey {
     // ── Core Contract State ──────────────────────────────────────────────────────
     
@@ -87,6 +87,10 @@ pub enum StorageKey {
     YieldStrategy,
     /// Harvest schedule and automation data
     HarvestSchedule,
+    /// Yield treasury generic config
+    Config,
+    /// Yield treasury generic metrics
+    Metrics,
     
     // ── Governance ─────────────────────────────────────────────────────────────
     
@@ -166,6 +170,14 @@ pub enum StorageKey {
     ComplianceData,
     /// Regulatory reporting snapshots
     RegulatoryReport(u64),
+    /// Per-grant claim valuation counter
+    ClaimValueCounter(u64),
+    /// Ledger-linked fiat valuation for a specific claim
+    ClaimValue(u64, u64),
+    /// Default SEP-38 quote/fiat asset for grant token claims
+    Sep38DefaultFiat,
+    /// Latest SEP-38 rate keyed by (base token, quote/fiat asset)
+    Sep38Rate(Address, String),
     
     // ── Multi-Token Operations ─────────────────────────────────────────────────
     
@@ -219,6 +231,8 @@ pub enum StorageKey {
     TemporaryData(Bytes),
     /// Migration status for contract upgrades
     MigrationStatus,
+    /// Protocol-wide pause reason
+    ProtocolPauseReason,
 }
 
 impl StorageKey {
@@ -259,7 +273,9 @@ impl StorageKey {
             | StorageKey::ReserveBalance
             | StorageKey::YieldToken
             | StorageKey::YieldStrategy
-            | StorageKey::HarvestSchedule => "treasury",
+            | StorageKey::HarvestSchedule
+            | StorageKey::Config
+            | StorageKey::Metrics => "treasury",
             
             // Governance
             StorageKey::Proposal(_)
@@ -300,7 +316,11 @@ impl StorageKey {
             | StorageKey::AuditLogEntry(_)
             | StorageKey::TaxFlowHistory(_)
             | StorageKey::ComplianceData
-            | StorageKey::RegulatoryReport(_) => "audit",
+            | StorageKey::RegulatoryReport(_)
+            | StorageKey::ClaimValueCounter(_)
+            | StorageKey::ClaimValue(_, _)
+            | StorageKey::Sep38DefaultFiat
+            | StorageKey::Sep38Rate(_, _) => "audit",
             
             // Multi-Token
             StorageKey::WrappedAsset(_)
@@ -329,7 +349,8 @@ impl StorageKey {
             StorageKey::ContractVersion
             | StorageKey::FeatureFlag(_)
             | StorageKey::TemporaryData(_)
-            | StorageKey::MigrationStatus => "misc",
+            | StorageKey::MigrationStatus
+            | StorageKey::ProtocolPauseReason => "misc",
         }
     }
     
@@ -366,6 +387,8 @@ impl StorageKey {
             StorageKey::YieldToken => "Token used for yield farming",
             StorageKey::YieldStrategy => "Yield farming strategy config",
             StorageKey::HarvestSchedule => "Automated harvest schedule",
+            StorageKey::Config => "Yield treasury generic configuration",
+            StorageKey::Metrics => "Yield treasury generic metrics",
             
             StorageKey::Proposal(_) => "Governance proposal data",
             StorageKey::Vote(_, _) => "Individual vote records",
@@ -404,6 +427,10 @@ impl StorageKey {
             StorageKey::TaxFlowHistory(_) => "User tax flow history",
             StorageKey::ComplianceData => "Compliance monitoring data",
             StorageKey::RegulatoryReport(_) => "Regulatory report snapshot",
+            StorageKey::ClaimValueCounter(_) => "Per-grant claim valuation counter",
+            StorageKey::ClaimValue(_, _) => "Ledger-linked claim fiat valuation",
+            StorageKey::Sep38DefaultFiat => "Default SEP-38 fiat quote asset",
+            StorageKey::Sep38Rate(_, _) => "SEP-38 grant-token fiat rate",
             
             StorageKey::WrappedAsset(_) => "Wrapped asset data",
             StorageKey::BridgeConfig => "Multi-token bridge config",
@@ -428,6 +455,7 @@ impl StorageKey {
             StorageKey::FeatureFlag(_) => "Feature flag configuration",
             StorageKey::TemporaryData(_) => "Temporary storage data",
             StorageKey::MigrationStatus => "Contract migration status",
+            StorageKey::ProtocolPauseReason => "Protocol-wide emergency pause reason",
         }
     }
 }
@@ -435,17 +463,22 @@ impl StorageKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn address() -> Address {
+        Address::generate(&soroban_sdk::Env::default())
+    }
 
     #[test]
     fn test_storage_key_namespace() {
         assert_eq!(StorageKey::Admin.namespace(), "core");
         assert_eq!(StorageKey::Grant(123).namespace(), "grant");
-        assert_eq!(StorageKey::RecipientGrants(Address::random()).namespace(), "user");
+        assert_eq!(StorageKey::RecipientGrants(address()).namespace(), "user");
         assert_eq!(StorageKey::TreasuryConfig.namespace(), "treasury");
         assert_eq!(StorageKey::Proposal(456).namespace(), "governance");
         assert_eq!(StorageKey::OracleFrozen.namespace(), "circuit_breaker");
         assert_eq!(StorageKey::AuditTxCounter.namespace(), "audit");
-        assert_eq!(StorageKey::WrappedAsset(Address::random()).namespace(), "multi_token");
+        assert_eq!(StorageKey::WrappedAsset(address()).namespace(), "multi_token");
         assert_eq!(StorageKey::EmergencySigners.namespace(), "emergency");
         assert_eq!(StorageKey::ReentrancyGuard.namespace(), "security");
         assert_eq!(StorageKey::LastHeartbeat.namespace(), "monitoring");
@@ -456,6 +489,6 @@ mod tests {
     fn test_storage_key_description() {
         assert!(!StorageKey::Admin.description().is_empty());
         assert!(!StorageKey::Grant(123).description().is_empty());
-        assert!(!StorageKey::RecipientGrants(Address::random()).description().is_empty());
+        assert!(!StorageKey::RecipientGrants(address()).description().is_empty());
     }
 }
