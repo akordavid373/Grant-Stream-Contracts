@@ -1,6 +1,8 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, Symbol, Vec, String,
 };
+use soroban_sdk::xdr::ToXdr;
 
 #[contract]
 pub struct GrantContract;
@@ -48,6 +50,25 @@ pub struct Grant {
     // Milestone support (issue #40)
     pub milestone_deadline: u64, // unix timestamp after which clawback is allowed
     pub milestone_met: bool,     // whether milestone was approved/met by DAO
+    pub milestone_threshold: u32,
+    pub milestone_dispute_window_secs: u64,
+    pub milestone_evidence_hash: Option<BytesN<32>>,
+    pub milestone_evidence_submitted_at: u64,
+    pub milestone_dispute_window_end: u64,
+    pub milestone_oracles: Vec<BytesN<32>>,
+    pub milestone_approvers: Vec<BytesN<32>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct MilestoneConsensusState {
+    pub evidence_hash: Option<BytesN<32>>,
+    pub threshold: u32,
+    pub dispute_window_secs: u64,
+    pub dispute_window_end: u64,
+    pub oracles: Vec<BytesN<32>>,
+    pub approvers: Vec<BytesN<32>>,
+    pub is_completed: bool,
 }
 
 #[derive(Clone)]
@@ -74,7 +95,13 @@ pub enum Error {
     InvalidStatusTransition = 10, // New error for invalid status transitions
     SoftPaused = 11,
     OracleFrozen = 12,
-    EvidenceRequired = 13,
+    InvalidMilestoneConfig = 13,
+    MilestoneEvidenceMissing = 14,
+    MilestoneAlreadyCompleted = 15,
+    MilestoneWindowClosed = 16,
+    OracleNotWhitelisted = 17,
+    DuplicateOracleApproval = 18,
+    EvidenceRequired = 19,
 }
 
 pub fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -209,6 +236,58 @@ pub fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     Ok(())
 }
 
+fn contains_oracle(oracles: &Vec<BytesN<32>>, oracle: &BytesN<32>) -> bool {
+    for i in 0..oracles.len() {
+        if oracles.get(i).unwrap() == *oracle {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_oracle_set(oracles: &Vec<BytesN<32>>, threshold: u32) -> Result<(), Error> {
+    if oracles.is_empty() || threshold == 0 || threshold as u32 > oracles.len() {
+        return Err(Error::InvalidMilestoneConfig);
+    }
+
+    for i in 0..oracles.len() {
+        let oracle = oracles.get(i).unwrap();
+        for j in (i + 1)..oracles.len() {
+            if oracle == oracles.get(j).unwrap() {
+                return Err(Error::InvalidMilestoneConfig);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_milestone_approval_payload(
+    env: &Env,
+    grant_id: u64,
+    evidence_hash: &BytesN<32>,
+    dispute_window_end: u64,
+) -> Bytes {
+    let mut payload = Bytes::from_array(env, b"milestone-approval-v1");
+    payload.append(&env.current_contract_address().to_xdr(env));
+    payload.append(&Bytes::from_array(env, &grant_id.to_be_bytes()));
+    payload.append(&Bytes::from_array(env, &dispute_window_end.to_be_bytes()));
+    payload.append(&Bytes::from_array(env, &evidence_hash.to_array()));
+    payload
+}
+
+fn milestone_state(grant: &Grant) -> MilestoneConsensusState {
+    MilestoneConsensusState {
+        evidence_hash: grant.milestone_evidence_hash.clone(),
+        threshold: grant.milestone_threshold,
+        dispute_window_secs: grant.milestone_dispute_window_secs,
+        dispute_window_end: grant.milestone_dispute_window_end,
+        oracles: grant.milestone_oracles.clone(),
+        approvers: grant.milestone_approvers.clone(),
+        is_completed: grant.milestone_met,
+    }
+}
+
 fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
     let mut preview = grant.clone();
     settle_grant(&mut preview, env.ledger().timestamp())?;
@@ -271,6 +350,13 @@ impl GrantContract {
             status_mask: initial_status_mask,
             milestone_deadline: 0,
             milestone_met: false,
+            milestone_threshold: 0,
+            milestone_dispute_window_secs: 0,
+            milestone_evidence_hash: None,
+            milestone_evidence_submitted_at: 0,
+            milestone_dispute_window_end: 0,
+            milestone_oracles: Vec::new(&env),
+            milestone_approvers: Vec::new(&env),
         };
 
         env.storage().instance().set(&key, &grant);
@@ -500,27 +586,128 @@ impl GrantContract {
         Ok(())
     }
 
-    /// Anchor milestone review evidence on-chain. The grant recipient must
-    /// submit a non-empty evidence anchor before the admin can approve the
-    /// milestone as met.
-    pub fn submit_milestone_evidence(env: Env, grant_id: u64, anchor: String) -> Result<(), Error> {
-        let grant = read_grant(&env, grant_id)?;
+    /// Configure the oracle whitelist and approval threshold for a
+    /// milestone-based grant.
+    pub fn configure_milestone_oracles(
+        env: Env,
+        grant_id: u64,
+        oracles: Vec<BytesN<32>>,
+        threshold: u32,
+        dispute_window_secs: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) || dispute_window_secs == 0 {
+            return Err(Error::InvalidMilestoneConfig);
+        }
+        validate_oracle_set(&oracles, threshold)?;
+
+        grant.milestone_oracles = oracles;
+        grant.milestone_threshold = threshold;
+        grant.milestone_dispute_window_secs = dispute_window_secs;
+        grant.milestone_evidence_hash = None;
+        grant.milestone_evidence_submitted_at = 0;
+        grant.milestone_dispute_window_end = 0;
+        grant.milestone_approvers = Vec::new(&env);
+        grant.milestone_met = false;
+
+        write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
+
+    /// Store the evidence hash in persistent storage and start the dispute
+    /// window for oracle approvals.
+    pub fn submit_milestone_evidence(
+        env: Env,
+        grant_id: u64,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        if !has_status(grant.status_mask, STATUS_MILESTONE_BASED)
+            || grant.milestone_threshold == 0
+            || grant.milestone_oracles.is_empty()
+        {
+            return Err(Error::InvalidMilestoneConfig);
+        }
+
         grant.recipient.require_auth();
 
+        let now = env.ledger().timestamp();
+        grant.milestone_evidence_hash = Some(evidence_hash);
+        grant.milestone_evidence_submitted_at = now;
+        grant.milestone_dispute_window_end = now + grant.milestone_dispute_window_secs;
+        grant.milestone_approvers = Vec::new(&env);
+        grant.milestone_met = false;
+
+        write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
+
+    /// Verify an oracle signature and record its approval. Consensus is reached
+    /// once the threshold of distinct whitelisted oracles has signed.
+    pub fn approve_milestone(
+        env: Env,
+        grant_id: u64,
+        oracle_public_key: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<u32, Error> {
+        let mut grant = read_grant(&env, grant_id)?;
         if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
             return Err(Error::InvalidState);
         }
-
-        if anchor.len() == 0 {
-            return Err(Error::InvalidAmount);
+        if grant.milestone_met {
+            return Err(Error::MilestoneAlreadyCompleted);
+        }
+        if !contains_oracle(&grant.milestone_oracles, &oracle_public_key) {
+            return Err(Error::OracleNotWhitelisted);
+        }
+        if contains_oracle(&grant.milestone_approvers, &oracle_public_key) {
+            return Err(Error::DuplicateOracleApproval);
         }
 
-        write_milestone_evidence(&env, grant_id, &anchor);
-        env.events().publish(
-            (symbol_short!("milestone_anchor"),),
-            (grant_id, anchor.clone()),
+        let evidence_hash = grant
+            .milestone_evidence_hash
+            .clone()
+            .ok_or(Error::MilestoneEvidenceMissing)?;
+        let now = env.ledger().timestamp();
+        if now > grant.milestone_dispute_window_end {
+            return Err(Error::MilestoneWindowClosed);
+        }
+
+        let payload = build_milestone_approval_payload(
+            &env,
+            grant_id,
+            &evidence_hash,
+            grant.milestone_dispute_window_end,
         );
-        Ok(())
+        env.crypto()
+            .ed25519_verify(&oracle_public_key, &payload, &signature);
+
+        grant.milestone_approvers.push_back(oracle_public_key.clone());
+        let approvals = grant.milestone_approvers.len();
+
+        if approvals >= grant.milestone_threshold {
+            grant.milestone_met = true;
+            if has_status(grant.status_mask, STATUS_PAUSED) {
+                grant.status_mask = clear_status(grant.status_mask, STATUS_PAUSED);
+                grant.status_mask = set_status(grant.status_mask, STATUS_ACTIVE);
+            }
+            env.events().publish(
+                (
+                    Symbol::new(&env, "MilestoneConsensusReached"),
+                    grant_id,
+                ),
+                grant.milestone_approvers.clone(),
+            );
+        }
+
+        write_grant(&env, grant_id, &grant);
+        Ok(approvals)
+    }
+
+    pub fn get_milestone_consensus(env: Env, grant_id: u64) -> Result<MilestoneConsensusState, Error> {
+        let grant = read_grant(&env, grant_id)?;
+        Ok(milestone_state(&grant))
     }
 
     /// Mark a milestone as met. After this call the admin can no longer claw
@@ -602,5 +789,221 @@ impl GrantContract {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod milestone_oracle_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn bytesn32(env: &Env, bytes: [u8; 32]) -> BytesN<32> {
+        BytesN::from_array(env, &bytes)
+    }
+
+    fn bytesn64(env: &Env, bytes: [u8; 64]) -> BytesN<64> {
+        BytesN::from_array(env, &bytes)
+    }
+
+    fn sign_approval(
+        env: &Env,
+        grant_id: u64,
+        evidence_hash: &BytesN<32>,
+        dispute_window_end: u64,
+        key: &SigningKey,
+    ) -> BytesN<64> {
+        let payload =
+            build_milestone_approval_payload(env, grant_id, evidence_hash, dispute_window_end);
+        let signature = key.sign(payload.to_array().as_slice()).to_bytes();
+        bytesn64(env, signature)
+    }
+
+    fn setup_grant(env: &Env) -> (Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let recipient = Address::generate(env);
+
+        GrantContract::initialize(env.clone(), admin.clone()).unwrap();
+        GrantContract::create_grant(
+            env.clone(),
+            7,
+            recipient.clone(),
+            1_000_000,
+            100,
+            STATUS_ACTIVE | STATUS_MILESTONE_BASED,
+        )
+        .unwrap();
+
+        (admin, recipient)
+    }
+
+    #[test]
+    fn milestone_reaches_consensus_at_two_of_three() {
+        let env = Env::default();
+        let (_admin, _recipient) = setup_grant(&env);
+
+        let key1 = signing_key(1);
+        let key2 = signing_key(2);
+        let key3 = signing_key(3);
+        let oracle_keys = Vec::from_array(
+            &env,
+            [
+                bytesn32(&env, key1.verifying_key().to_bytes()),
+                bytesn32(&env, key2.verifying_key().to_bytes()),
+                bytesn32(&env, key3.verifying_key().to_bytes()),
+            ],
+        );
+
+        GrantContract::configure_milestone_oracles(
+            env.clone(),
+            7,
+            oracle_keys,
+            2,
+            300,
+        )
+        .unwrap();
+
+        let evidence_hash = bytesn32(&env, [9; 32]);
+        GrantContract::submit_milestone_evidence(env.clone(), 7, evidence_hash.clone()).unwrap();
+
+        let state = GrantContract::get_milestone_consensus(env.clone(), 7).unwrap();
+        assert_eq!(state.approvers.len(), 0);
+        assert!(!state.is_completed);
+
+        let sig1 = sign_approval(&env, 7, &evidence_hash, state.dispute_window_end, &key1);
+        let sig2 = sign_approval(&env, 7, &evidence_hash, state.dispute_window_end, &key2);
+
+        assert_eq!(
+            GrantContract::approve_milestone(
+                env.clone(),
+                7,
+                bytesn32(&env, key1.verifying_key().to_bytes()),
+                sig1,
+            )
+            .unwrap(),
+            1
+        );
+
+        let interim = GrantContract::get_milestone_consensus(env.clone(), 7).unwrap();
+        assert_eq!(interim.approvers.len(), 1);
+        assert!(!interim.is_completed);
+
+        assert_eq!(
+            GrantContract::approve_milestone(
+                env.clone(),
+                7,
+                bytesn32(&env, key2.verifying_key().to_bytes()),
+                sig2,
+            )
+            .unwrap(),
+            2
+        );
+
+        let finalized = GrantContract::get_milestone_consensus(env.clone(), 7).unwrap();
+        assert_eq!(finalized.approvers.len(), 2);
+        assert!(finalized.is_completed);
+
+        let grant = GrantContract::get_grant(env.clone(), 7).unwrap();
+        assert!(grant.milestone_met);
+    }
+
+    #[test]
+    fn duplicate_oracle_approval_is_rejected() {
+        let env = Env::default();
+        let (_admin, _recipient) = setup_grant(&env);
+
+        let key1 = signing_key(11);
+        let key2 = signing_key(12);
+        let key3 = signing_key(13);
+        GrantContract::configure_milestone_oracles(
+            env.clone(),
+            7,
+            Vec::from_array(
+                &env,
+                [
+                    bytesn32(&env, key1.verifying_key().to_bytes()),
+                    bytesn32(&env, key2.verifying_key().to_bytes()),
+                    bytesn32(&env, key3.verifying_key().to_bytes()),
+                ],
+            ),
+            2,
+            300,
+        )
+        .unwrap();
+
+        let evidence_hash = bytesn32(&env, [7; 32]);
+        GrantContract::submit_milestone_evidence(env.clone(), 7, evidence_hash.clone()).unwrap();
+        let state = GrantContract::get_milestone_consensus(env.clone(), 7).unwrap();
+        let pk = bytesn32(&env, key1.verifying_key().to_bytes());
+        let sig = sign_approval(&env, 7, &evidence_hash, state.dispute_window_end, &key1);
+
+        GrantContract::approve_milestone(env.clone(), 7, pk.clone(), sig).unwrap();
+
+        let duplicate_sig =
+            sign_approval(&env, 7, &evidence_hash, state.dispute_window_end, &key1);
+        let err =
+            GrantContract::approve_milestone(env.clone(), 7, pk, duplicate_sig).unwrap_err();
+        assert_eq!(err, Error::DuplicateOracleApproval);
+    }
+
+    #[test]
+    fn milestone_stays_locked_after_dispute_window() {
+        let env = Env::default();
+        let (_admin, _recipient) = setup_grant(&env);
+
+        let key1 = signing_key(21);
+        let key2 = signing_key(22);
+        let key3 = signing_key(23);
+        GrantContract::configure_milestone_oracles(
+            env.clone(),
+            7,
+            Vec::from_array(
+                &env,
+                [
+                    bytesn32(&env, key1.verifying_key().to_bytes()),
+                    bytesn32(&env, key2.verifying_key().to_bytes()),
+                    bytesn32(&env, key3.verifying_key().to_bytes()),
+                ],
+            ),
+            2,
+            10,
+        )
+        .unwrap();
+
+        let evidence_hash = bytesn32(&env, [3; 32]);
+        GrantContract::submit_milestone_evidence(env.clone(), 7, evidence_hash.clone()).unwrap();
+        let state = GrantContract::get_milestone_consensus(env.clone(), 7).unwrap();
+        let sig1 = sign_approval(&env, 7, &evidence_hash, state.dispute_window_end, &key1);
+
+        GrantContract::approve_milestone(
+            env.clone(),
+            7,
+            bytesn32(&env, key1.verifying_key().to_bytes()),
+            sig1,
+        )
+        .unwrap();
+
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp = state.dispute_window_end + 1;
+        });
+
+        let sig2 = sign_approval(&env, 7, &evidence_hash, state.dispute_window_end, &key2);
+        let err = GrantContract::approve_milestone(
+            env.clone(),
+            7,
+            bytesn32(&env, key2.verifying_key().to_bytes()),
+            sig2,
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::MilestoneWindowClosed);
+
+        let final_state = GrantContract::get_milestone_consensus(env.clone(), 7).unwrap();
+        assert_eq!(final_state.approvers.len(), 1);
+        assert!(!final_state.is_completed);
     }
 }

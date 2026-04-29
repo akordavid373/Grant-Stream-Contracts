@@ -258,6 +258,7 @@ fn test_is_active_grantee_archived_data() {
     // Test with user who had grants but all are now completed/cancelled
     // This simulates the "stale records" edge case
 }
+
 #[test]
 fn test_warmup() {
     let env = Env::default();
