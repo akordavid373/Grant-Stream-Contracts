@@ -3,7 +3,7 @@
 use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, Error, SCALING_FACTOR, MIN_WITHDRAWAL};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env,
+    token, Address, Env, Symbol,
 };
 
 fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantStreamContractClient) {
@@ -76,6 +76,45 @@ fn test_is_active_grantee_basic_functionality() {
         // For testing, we'll manually set the status to completed
         // In real scenarios, this would happen through normal flow
     }
+}
+
+#[test]
+fn test_current_claimable_amounts_are_previewed_without_storage_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let validator = Address::generate(&env);
+    let grant_id = 1u64;
+    let total_amount = 1000 * SCALING_FACTOR;
+    let flow_rate = 1 * SCALING_FACTOR;
+
+    set_timestamp(&env, 100);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0u64, &Some(validator.clone()));
+    set_timestamp(&env, 110);
+
+    let (claimable, validator_claimable) = client.get_current_claimable_amounts(&grant_id).unwrap();
+    assert_eq!(claimable, 95 * SCALING_FACTOR);
+    assert_eq!(validator_claimable, 5 * SCALING_FACTOR);
+
+    let stored_grant = client.get_grant(&grant_id).unwrap();
+    assert_eq!(stored_grant.claimable, 0, "Preview query should not mutate stored grant state");
+    assert_eq!(stored_grant.validator_claimable, 0, "Preview query should not mutate stored grant state");
+}
+
+#[test]
+fn test_get_health_factor_is_read_only_preview() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let grant_id = 1u64;
+    let recipient = Address::generate(&env);
+
+    client.create_grant(&grant_id, &recipient, &100_000i128, &1_000i128, &0u64, &None);
+    env.storage().instance().set(&super::storage_keys::StorageKey::ReserveBalance, &100_000i128);
+
+    let health = client.get_health_factor().unwrap();
+    assert_eq!(health, 9000, "Health factor should reflect the current reserve and liabilities without mutating state");
 }
 
 #[test]

@@ -39,6 +39,9 @@ pub mod multi_threshold;
 #[cfg(test)]
 mod test_dispute_circuit_breaker;
 
+#[cfg(test)]
+mod test_trustline_validation;
+
 // --- Types ---
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,14 +117,14 @@ pub struct Grant {
 pub struct GrantStream;
 
 
-// Legacy DataKey alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy DataKey alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type DataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u32)]
-pub enum Error {
+pub enum GrantStreamError {
     NotInitialized = 1,
     AlreadyInitialized = 2,
     NotAuthorized = 3,
@@ -136,13 +139,15 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     NotValidator = 14,
-    LegalSignatureRequired = 15,
+    KycMissing = 15,
     GrantNotPurgeable = 16,
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
     WithdrawalBelowMinimum = 20,
 }
+
+pub type Error = GrantStreamError;
 
 // --- Internal Helpers ---
 
@@ -187,6 +192,19 @@ fn read_grant_ids(env: &Env) -> Vec<u64> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
+fn read_expected_milestone_nonce(env: &Env, grant_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneSubmitNonce(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_expected_milestone_nonce(env: &Env, grant_id: u64, next_nonce: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MilestoneSubmitNonce(grant_id), &next_nonce);
+}
+
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let mut total = 0_i128;
     let ids = read_grant_ids(env);
@@ -202,6 +220,12 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
         }
     }
     Ok(total)
+}
+
+fn preview_grant_at_now(grant: &Grant, now: u64) -> Result<Grant, Error> {
+    let mut preview = grant.clone();
+    settle_grant(&mut preview, now)?;
+    Ok(preview)
 }
 
 fn count_active_grants(env: &Env) -> u32 {
@@ -244,6 +268,12 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
 /// When no validator is set the full amount goes to the grantee.
 fn apply_accrued_split(grant: &mut Grant, accrued: i128) -> Result<(), Error> {
     if grant.validator.is_some() && accrued > 0 {
+        // ROUNDING BEHAVIOR: Integer division with checked_div truncates toward zero
+        // (rounds down for positive numbers). This is INTENTIONAL and CORRECT.
+        // It ensures the contract always retains any fractional remainder, preventing
+        // the "Point One Cent" exploit where rounding up could slowly drain the contract
+        // beyond its obligations over many transactions.
+        // See test_point_one_cent_exploit.rs for comprehensive proof.
         let validator_share = accrued
             .checked_mul(500)
             .ok_or(Error::MathOverflow)?
@@ -440,6 +470,9 @@ fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Erro
     let base_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
 
     let multiplier = calculate_warmup_multiplier(grant, now);
+    // ROUNDING BEHAVIOR: Division rounds down (truncates toward zero).
+    // This ensures accrued amounts never exceed what should be paid out,
+    // maintaining the contract's solvency. See test_point_one_cent_exploit.rs.
     let accrued = base_accrued
         .checked_mul(multiplier)
         .ok_or(Error::MathOverflow)?
@@ -552,6 +585,10 @@ impl GrantStreamContract {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
 
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
@@ -574,7 +611,7 @@ impl GrantStreamContract {
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
-            return Err(Error::LegalSignatureRequired);
+            return Err(Error::KycMissing);
         }
 
         if grant.claimable < MIN_WITHDRAWAL {
@@ -592,7 +629,7 @@ impl GrantStreamContract {
         write_grant(&env, grant_id, &grant);
 
         // Issue #311: record withdrawal velocity; may engage SoftPause.
-        circuit_breakers::record_withdrawal_velocity(&env, amount);
+        let _ = circuit_breakers::record_withdrawal_velocity(&env, amount)?;
 
         // Storage Rent Depletion: check rent balance after withdrawal
         circuit_breakers::check_rent_balance(&env);
@@ -855,7 +892,7 @@ impl GrantStreamContract {
     /// Sanity-check oracle confirms a suspicious price, clearing the freeze.
     pub fn confirm_oracle_price(env: Env, caller: Address, confirmed_price: i128) -> Result<(), Error> {
         if confirmed_price <= 0 { return Err(Error::InvalidAmount); }
-        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price);
+        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price)?;
         Ok(())
     }
 
@@ -928,6 +965,25 @@ impl GrantStreamContract {
         } else {
             0
         }
+    }
+
+    /// Current claimable values for a grant without mutating storage.
+    pub fn get_current_claimable_amounts(env: Env, grant_id: u64) -> Result<(i128, i128), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        let preview = preview_grant_at_now(&grant, env.ledger().timestamp())?;
+        Ok((preview.claimable, preview.validator_claimable))
+    }
+
+    /// Current grantee claimable amount without mutating storage.
+    pub fn get_current_grantee_claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
+        let (claimable, _) = Self::get_current_claimable_amounts(env, grant_id)?;
+        Ok(claimable)
+    }
+
+    /// Current validator claimable amount without mutating storage.
+    pub fn get_current_validator_claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
+        let (_, validator_claimable) = Self::get_current_claimable_amounts(env, grant_id)?;
+        Ok(validator_claimable)
     }
 
     /// Compute the claimable balance for exponential vesting.
@@ -1189,6 +1245,55 @@ impl GrantStreamContract {
         Ok(())
     }
 
+    /// Submit an off-chain milestone proof with monotonic nonce protection.
+    ///
+    /// Replay prevention:
+    /// - Every grant tracks an expected nonce starting at 0.
+    /// - Submission is accepted only when `nonce == expected_nonce`.
+    /// - The expected nonce is incremented after a successful write.
+    ///
+    /// Cancellation edge case:
+    /// - Cancelled / rage-quit / completed grants reject new milestone proofs.
+    pub fn submit_milestone_proof(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        proof: Symbol,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status == GrantStatus::Cancelled
+            || grant.status == GrantStatus::RageQuitted
+            || grant.status == GrantStatus::Completed
+        {
+            return Err(Error::InvalidState);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+        if env.storage().persistent().has(&milestone_key) {
+            return Err(Error::InvalidState);
+        }
+
+        let expected_nonce = read_expected_milestone_nonce(&env, grant_id);
+        if nonce != expected_nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        env.storage().persistent().set(&milestone_key, &proof);
+
+        let next_nonce = nonce.checked_add(1).ok_or(Error::MathOverflow)?;
+        write_expected_milestone_nonce(&env, grant_id, next_nonce);
+
+        env.events().publish(
+            (symbol_short!("mil_sub"),),
+            (grant_id, milestone_index, nonce),
+        );
+
+        Ok(())
+    }
+
     pub fn emit_grant_status(env: Env, grant_id: u64) -> Result<soroban_sdk::Bytes, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         settle_grant(&mut grant, env.ledger().timestamp())?;
@@ -1203,10 +1308,10 @@ impl GrantStreamContract {
         Ok(data)
     }
 
+    /// Get the current protocol health factor in basis points without mutating on-chain state.
     pub fn get_health_factor(env: Env) -> Result<i128, Error> {
         let liabilities = total_allocated_funds(&env)?;
-        // Call yield_treasury module implementation
-        match yield_treasury::YieldTreasuryContract::calculate_pool_health(env, liabilities) {
+        match yield_treasury::YieldTreasuryContract::preview_pool_health(env, liabilities) {
             Ok(hf) => Ok(hf),
             Err(_) => Err(Error::MathOverflow), // Map to generic error for simplicity
         }
@@ -1229,6 +1334,19 @@ impl GrantStreamContract {
         // 2. Must have no pending claims
         if grant.claimable > 0 || grant.validator_claimable > 0 {
             return Err(Error::GrantNotPurgeable);
+        }
+
+        // 3. Completed grants must be fully accounted before deletion.
+        // This prevents accidental state deletion if any user funds are still
+        // represented in grant accounting due to an upstream bug.
+        if grant.status == GrantStatus::Completed {
+            let accounted = grant.withdrawn
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            if accounted != grant.total_amount {
+                return Err(Error::GrantNotPurgeable);
+            }
         }
 
         // Cleanup state: Remove grant from storage
@@ -1328,7 +1446,7 @@ impl GrantStreamContract {
         signers: soroban_sdk::Vec<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
-        multi_threshold::initialize_signers(&env, signers);
+        multi_threshold::initialize_signers(&env, signers)?;
         Ok(())
     }
 
@@ -1340,12 +1458,12 @@ impl GrantStreamContract {
         kind: multi_threshold::RescueKind,
         rescue_to: Address,
         amount: i128,
-    ) -> u64 {
+    ) -> Result<u64, Error> {
         multi_threshold::propose_rescue(&env, proposer, kind, rescue_to, amount)
     }
 
     /// Add an approval to a pending rescue proposal.
-    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) {
+    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) -> Result<(), Error> {
         multi_threshold::approve_rescue(&env, signer, proposal_id)
     }
 
@@ -1358,14 +1476,14 @@ impl GrantStreamContract {
         token_address: Address,
     ) -> Result<(), Error> {
         let (rescue_to, amount) =
-            multi_threshold::execute_rescue(&env, caller, proposal_id);
+            multi_threshold::execute_rescue(&env, caller, proposal_id)?;
         let client = token::Client::new(&env, &token_address);
         client.transfer(&env.current_contract_address(), &rescue_to, &amount);
         Ok(())
     }
 
     /// Cancel a pending rescue proposal.  Only the original proposer may cancel.
-    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) {
+    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) -> Result<(), Error> {
         multi_threshold::cancel_rescue(&env, proposer, proposal_id)
     }
 
@@ -1439,5 +1557,7 @@ mod test_temporal_fuzz;
 mod test_global_invariant_fuzz;
 #[cfg(test)]
 mod test_security_invariants;
+#[cfg(test)]
+mod test_point_one_cent_exploit;
 #[cfg(test)]
 mod is_active_grantee_benchmark;
