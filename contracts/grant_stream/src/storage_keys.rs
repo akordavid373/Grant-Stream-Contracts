@@ -55,6 +55,10 @@ pub enum StorageKey {
     GrantMetrics(u64),
     /// Grant dispute status and resolution data
     GrantDisputeData(u64),
+    /// Double-approval request for high-value milestone payouts
+    DoubleApprovalRequest(u64, u32),
+    /// Double-approval configuration and thresholds
+    DoubleApprovalConfig,
     
     // ── User Data ───────────────────────────────────────────────────────────────
     
@@ -242,7 +246,9 @@ impl StorageKey {
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
             | StorageKey::GrantMetrics(_)
-            | StorageKey::GrantDisputeData(_) => "grant",
+            | StorageKey::GrantDisputeData(_)
+            | StorageKey::DoubleApprovalRequest(_, _)
+            | StorageKey::DoubleApprovalConfig => "grant",
             
             // User Data
             StorageKey::RecipientGrants(_)
@@ -351,6 +357,8 @@ impl StorageKey {
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
             StorageKey::GrantMetrics(_) => "Grant performance metrics",
             StorageKey::GrantDisputeData(_) => "Grant dispute status",
+            StorageKey::DoubleApprovalRequest(_, _) => "Double-approval request for milestone",
+            StorageKey::DoubleApprovalConfig => "Double-approval configuration",
             
             StorageKey::RecipientGrants(_) => "Grants associated with recipient",
             StorageKey::UserBalance(_) => "User balance information",
