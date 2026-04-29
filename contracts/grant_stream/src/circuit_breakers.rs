@@ -47,8 +47,8 @@ const RENT_BUFFER_XLM: i128 = MONTHLY_RENT_XLM * RENT_BUFFER_MONTHS as i128; // 
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
-// Legacy CircuitBreakerKey type alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy CircuitBreakerKey type alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type CircuitBreakerKey = StorageKey;
 
 // ── Oracle Price Guard (Issue #312) ───────────────────────────────────────────

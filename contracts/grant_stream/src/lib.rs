@@ -112,8 +112,8 @@ pub struct Grant {
 pub struct GrantStream;
 
 
-// Legacy DataKey alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy DataKey alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type DataKey = StorageKey;
 
 #[contracterror]
