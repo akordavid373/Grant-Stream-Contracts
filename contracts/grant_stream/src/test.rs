@@ -52,6 +52,62 @@ fn test_pipeline() {
 }
 
 #[test]
+fn test_milestone_submission_deposit_refunded_on_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, native_token_addr, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let native_token = token::Client::new(&env, &native_token_addr);
+    let native_token_admin = token::StellarAssetClient::new(&env, &native_token_addr);
+    let grant_id = 77u64;
+    let deposit = 100_000i128;
+
+    native_token_admin.mint(&recipient, &1_000_000i128);
+    client.create_grant(&grant_id, &recipient, &1_000_000i128, &1_000i128, &0u64, &None, &None);
+
+    let recipient_before = native_token.balance(&recipient);
+    let contract_before = native_token.balance(&client.address);
+    client.submit_milestone_proof(&grant_id, &0u32, &Symbol::new(&env, "m0"), &0u64).unwrap();
+    let recipient_after_submit = native_token.balance(&recipient);
+    let contract_after_submit = native_token.balance(&client.address);
+
+    assert_eq!(recipient_after_submit, recipient_before - deposit);
+    assert_eq!(contract_after_submit, contract_before + deposit);
+
+    client.approve_milestone_submission(&grant_id, &0u32).unwrap();
+    let recipient_after_approval = native_token.balance(&recipient);
+    let contract_after_approval = native_token.balance(&client.address);
+
+    assert_eq!(recipient_after_approval, recipient_before);
+    assert_eq!(contract_after_approval, contract_before);
+}
+
+#[test]
+fn test_milestone_submission_deposit_slashed_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, treasury, _oracle, native_token_addr, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let native_token = token::Client::new(&env, &native_token_addr);
+    let native_token_admin = token::StellarAssetClient::new(&env, &native_token_addr);
+    let grant_id = 78u64;
+    let deposit = 100_000i128;
+
+    native_token_admin.mint(&recipient, &1_000_000i128);
+    client.create_grant(&grant_id, &recipient, &1_000_000i128, &1_000i128, &0u64, &None, &None);
+
+    let treasury_before = native_token.balance(&treasury);
+    let contract_before = native_token.balance(&client.address);
+    client.submit_milestone_proof(&grant_id, &0u32, &Symbol::new(&env, "m1"), &0u64).unwrap();
+    client.slash_milestone_submission_deposit(&grant_id, &0u32).unwrap();
+
+    let treasury_after = native_token.balance(&treasury);
+    let contract_after = native_token.balance(&client.address);
+    assert_eq!(treasury_after, treasury_before + deposit);
+    assert_eq!(contract_after, contract_before);
+}
+
+#[test]
 fn test_is_active_grantee_basic_functionality() {
     let env = Env::default();
     env.mock_all_auths();

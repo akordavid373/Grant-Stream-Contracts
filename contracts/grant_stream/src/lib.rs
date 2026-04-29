@@ -13,6 +13,7 @@ pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
 pub const SEP38_STALENESS_SECONDS: u64 = 5 * 60;
 const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+const MILESTONE_SUBMISSION_DEPOSIT_XLM: i128 = 100_000; // 0.01 XLM (stroops)
 // Minimum claimable balance required before a withdrawal is permitted (1 USDC in 7-decimal units)
 pub const MIN_WITHDRAWAL: i128 = 10_000_000;
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
@@ -175,6 +176,8 @@ pub enum GrantStreamError {
     OracleFrozen = 20,
     RentPreservationMode = 21,
     InvalidTimestamp = 22,
+    InvalidNonce = 23,
+    SubmissionDepositNotFound = 24,
 }
 
 pub type Error = GrantStreamError;
@@ -334,6 +337,18 @@ fn write_expected_milestone_nonce(env: &Env, grant_id: u64, next_nonce: u64) {
     env.storage()
         .instance()
         .set(&DataKey::MilestoneSubmitNonce(grant_id), &next_nonce);
+}
+
+fn set_milestone_submission_deposit(env: &Env, grant_id: u64, milestone_index: u32, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MilestoneSubmissionDeposit(grant_id, milestone_index), &amount);
+}
+
+fn get_milestone_submission_deposit(env: &Env, grant_id: u64, milestone_index: u32) -> Option<i128> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneSubmissionDeposit(grant_id, milestone_index))
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -1571,7 +1586,21 @@ impl GrantStreamContract {
             return Err(Error::InvalidNonce);
         }
 
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        native_client.transfer(
+            &grant.recipient,
+            &env.current_contract_address(),
+            &MILESTONE_SUBMISSION_DEPOSIT_XLM,
+        );
+
         env.storage().persistent().set(&milestone_key, &proof);
+        set_milestone_submission_deposit(
+            &env,
+            grant_id,
+            milestone_index,
+            MILESTONE_SUBMISSION_DEPOSIT_XLM,
+        );
 
         let next_nonce = nonce.checked_add(1).ok_or(Error::MathOverflow)?;
         write_expected_milestone_nonce(&env, grant_id, next_nonce);
@@ -1581,6 +1610,52 @@ impl GrantStreamContract {
             (grant_id, milestone_index, nonce),
         );
 
+        Ok(())
+    }
+
+    /// Admin-only: approve a milestone submission and refund its anti-spam deposit.
+    pub fn approve_milestone_submission(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let grant = read_grant(&env, grant_id)?;
+        let deposit = get_milestone_submission_deposit(&env, grant_id, milestone_index)
+            .ok_or(Error::SubmissionDepositNotFound)?;
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        native_client.transfer(&env.current_contract_address(), &grant.recipient, &deposit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::MilestoneSubmissionDeposit(grant_id, milestone_index));
+        env.events().publish(
+            (symbol_short!("mil_depr"),),
+            (grant_id, milestone_index, deposit),
+        );
+        Ok(())
+    }
+
+    /// Admin-only: slash a fraudulent milestone submission deposit to treasury.
+    pub fn slash_milestone_submission_deposit(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let deposit = get_milestone_submission_deposit(&env, grant_id, milestone_index)
+            .ok_or(Error::SubmissionDepositNotFound)?;
+        let treasury = read_treasury(&env)?;
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        native_client.transfer(&env.current_contract_address(), &treasury, &deposit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::MilestoneSubmissionDeposit(grant_id, milestone_index));
+        env.events().publish(
+            (symbol_short!("mil_deps"),),
+            (grant_id, milestone_index, deposit),
+        );
         Ok(())
     }
 

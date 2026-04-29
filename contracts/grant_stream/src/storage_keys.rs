@@ -47,6 +47,8 @@ pub enum StorageKey {
     Milestone(u64, u32),
     /// Expected monotonic nonce for off-chain milestone proof submission
     MilestoneSubmitNonce(u64),
+    /// Escrowed anti-spam submission deposit keyed by (grant_id, milestone_index)
+    MilestoneSubmissionDeposit(u64, u32),
     /// Grant streaming metadata and configuration
     GrantStreamConfig(u64),
     /// Grant legal compliance data (hashes, signatures)
@@ -278,6 +280,7 @@ impl StorageKey {
             StorageKey::Grant(_)
             | StorageKey::Milestone(_, _)
             | StorageKey::MilestoneSubmitNonce(_)
+            | StorageKey::MilestoneSubmissionDeposit(_, _)
             | StorageKey::GrantStreamConfig(_)
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
@@ -405,6 +408,8 @@ impl StorageKey {
             
             StorageKey::Grant(_) => "Individual grant data and metadata",
             StorageKey::Milestone(_, _) => "Grant milestone information",
+            StorageKey::MilestoneSubmitNonce(_) => "Expected nonce for milestone proof submission",
+            StorageKey::MilestoneSubmissionDeposit(_, _) => "Escrowed anti-spam deposit for milestone submission",
             StorageKey::GrantStreamConfig(_) => "Grant streaming configuration",
             StorageKey::GrantLegalData(_) => "Grant legal compliance data",
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
