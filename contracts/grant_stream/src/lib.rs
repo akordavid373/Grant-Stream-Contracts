@@ -37,6 +37,9 @@ pub mod multi_threshold;
 #[cfg(test)]
 mod test_dispute_circuit_breaker;
 
+#[cfg(test)]
+mod test_trustline_validation;
+
 // --- Types ---
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,14 +115,14 @@ pub struct Grant {
 pub struct GrantStream;
 
 
-// Legacy DataKey alias for backward compatibility
-// TODO: Migrate all usage to StorageKey
+// Legacy DataKey alias preserved for backward compatibility.
+// All runtime storage uses `StorageKey` directly.
 type DataKey = StorageKey;
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u32)]
-pub enum Error {
+pub enum GrantStreamError {
     NotInitialized = 1,
     AlreadyInitialized = 2,
     NotAuthorized = 3,
@@ -134,12 +137,24 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     NotValidator = 14,
-    LegalSignatureRequired = 15,
+    KycMissing = 15,
     GrantNotPurgeable = 16,
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
+    AlreadyApproved = 20,
+    NotRegisteredSigner = 21,
+    ProposalNotFound = 22,
+    ProposalNotPending = 23,
+    InsufficientApprovals = 24,
+    NotSanityOracle = 25,
+    MilestoneNotReady = 26,
+    FundsLocked = 27,
+    InvalidSignature = 28,
+    RentPreservationMode = 29,
 }
+
+pub type Error = GrantStreamError;
 
 // --- Internal Helpers ---
 
@@ -571,7 +586,7 @@ impl GrantStreamContract {
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if grant.requires_legal_signature && !grant.is_legal_signed {
-            return Err(Error::LegalSignatureRequired);
+            return Err(Error::KycMissing);
         }
 
         if amount > grant.claimable {
@@ -585,7 +600,7 @@ impl GrantStreamContract {
         write_grant(&env, grant_id, &grant);
 
         // Issue #311: record withdrawal velocity; may engage SoftPause.
-        circuit_breakers::record_withdrawal_velocity(&env, amount);
+        let _ = circuit_breakers::record_withdrawal_velocity(&env, amount)?;
 
         // Storage Rent Depletion: check rent balance after withdrawal
         circuit_breakers::check_rent_balance(&env);
@@ -848,7 +863,7 @@ impl GrantStreamContract {
     /// Sanity-check oracle confirms a suspicious price, clearing the freeze.
     pub fn confirm_oracle_price(env: Env, caller: Address, confirmed_price: i128) -> Result<(), Error> {
         if confirmed_price <= 0 { return Err(Error::InvalidAmount); }
-        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price);
+        circuit_breakers::confirm_oracle_price(&env, &caller, confirmed_price)?;
         Ok(())
     }
 
@@ -1321,7 +1336,7 @@ impl GrantStreamContract {
         signers: soroban_sdk::Vec<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
-        multi_threshold::initialize_signers(&env, signers);
+        multi_threshold::initialize_signers(&env, signers)?;
         Ok(())
     }
 
@@ -1333,12 +1348,12 @@ impl GrantStreamContract {
         kind: multi_threshold::RescueKind,
         rescue_to: Address,
         amount: i128,
-    ) -> u64 {
+    ) -> Result<u64, Error> {
         multi_threshold::propose_rescue(&env, proposer, kind, rescue_to, amount)
     }
 
     /// Add an approval to a pending rescue proposal.
-    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) {
+    pub fn approve_rescue(env: Env, signer: Address, proposal_id: u64) -> Result<(), Error> {
         multi_threshold::approve_rescue(&env, signer, proposal_id)
     }
 
@@ -1351,14 +1366,14 @@ impl GrantStreamContract {
         token_address: Address,
     ) -> Result<(), Error> {
         let (rescue_to, amount) =
-            multi_threshold::execute_rescue(&env, caller, proposal_id);
+            multi_threshold::execute_rescue(&env, caller, proposal_id)?;
         let client = token::Client::new(&env, &token_address);
         client.transfer(&env.current_contract_address(), &rescue_to, &amount);
         Ok(())
     }
 
     /// Cancel a pending rescue proposal.  Only the original proposer may cancel.
-    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) {
+    pub fn cancel_rescue(env: Env, proposer: Address, proposal_id: u64) -> Result<(), Error> {
         multi_threshold::cancel_rescue(&env, proposer, proposal_id)
     }
 
