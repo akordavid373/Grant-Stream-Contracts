@@ -186,8 +186,17 @@ pub enum DataKey {
     StagedApprovals(u64),
     StagedApprovalIds,
     
-    // Emergency resumption
-    EmergencyResumption(u64),
+    // #415: Authorized Grantee Change data
+    GranteeChangeRequest(u64),
+    GranteeChangeRequests(u64),
+    GranteeChangeIds,
+    NextGranteeChangeRequestId,
+    
+    // #416: Emergency Grace Period data
+    EmergencyResumptionRequest(u64),
+    EmergencyResumptionRequests(u64),
+    EmergencyResumptionIds,
+    NextEmergencyResumptionRequestId,
     
     // Tax and jurisdiction
     TaxWithholdingRecord(u64),
@@ -6543,6 +6552,33 @@ fn get_next_trustline_check_id(env: &Env) -> u64 {
     env.ledger().sequence + 5000000
 }
 
+// --- Helper Functions ---
+
+fn read_admin(env: &Env) -> Result<Address, Error> {
+    env.storage().instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)
+}
+
+fn read_treasury(env: &Env) -> Result<Address, Error> {
+    // Simplified treasury address - in production this would be configurable
+    env.storage().instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)
+}
+
+fn read_grant_token(env: &Env) -> Result<Address, Error> {
+    // Simplified - in production this would be grant-specific
+    // For now, return a placeholder address
+    Ok(Address::from_string(&String::from_str(env, "CDLZFC3SYJYDZT7K67VZ75ACEJVXZ7XWLU5V4FGZGTJAMJ5G2H2M4FVK")))
+}
+
+fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
+    env.storage().instance()
+        .get(&DataKey::Grant(grant_id))
+        .ok_or(Error::GrantNotFound)
+}
+
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -6564,5 +6600,7 @@ mod test_yield;
 mod test_fee;
 #[cfg(test)]
 mod test_milestone_clawback_trustline;
+#[cfg(test)]
+mod test_security_implementations;
 #[cfg(test)]
 
