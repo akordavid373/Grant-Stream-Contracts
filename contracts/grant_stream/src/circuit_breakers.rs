@@ -209,6 +209,8 @@ pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> Result<bool, Error
         return Err(Error::SoftPaused);
     }
 
+    assert!(amount > 0, "record_withdrawal_velocity: amount must be positive");
+
     let now: u64 = env.ledger().timestamp();
     let window_start: u64 = env
         .storage()
