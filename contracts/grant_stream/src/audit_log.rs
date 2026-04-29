@@ -93,7 +93,7 @@ pub fn update_audit_leaf(env: &Env, grant_id: u64, balance: i128) {
         .storage()
         .instance()
         .get(&AuditKey::TxCounter)
-        .unwrap_or(0)
+        .unwrap_or(0_u32)
         .saturating_add(1);
     env.storage()
         .instance()

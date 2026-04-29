@@ -9,7 +9,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{Address, Bytes, Env};
+    use soroban_sdk::{Address, Bytes, Env, String};
 
     #[test]
     fn test_storage_key_namespaces() {
@@ -77,12 +77,16 @@ mod tests {
             (Key::RentMode, "circuit_breaker"),
             (Key::RentThres, "circuit_breaker"),
             
-            (Key::AudTxCnt, "audit"),
-            (Key::AudRoot, "audit"),
-            (Key::AudLog(789), "audit"),
-            (Key::TaxHist(Address::random()), "audit"),
-            (Key::ComplDat, "audit"),
-            (Key::RegRep(101112), "audit"),
+            (StorageKey::AuditTxCounter, "audit"),
+            (StorageKey::AuditMerkleRoot, "audit"),
+            (StorageKey::AuditLogEntry(789), "audit"),
+            (StorageKey::TaxFlowHistory(Address::random()), "audit"),
+            (StorageKey::ComplianceData, "audit"),
+            (StorageKey::RegulatoryReport(101112), "audit"),
+            (StorageKey::ClaimValueCounter(1), "audit"),
+            (StorageKey::ClaimValue(1, 1), "audit"),
+            (StorageKey::Sep38DefaultFiat, "audit"),
+            (StorageKey::Sep38Rate(Address::random(), String::from_str(&Env::default(), "USD")), "audit"),
             
             (Key::WrapAst(Address::random()), "multi_token"),
             (Key::BridgeCfg, "multi_token"),
@@ -103,10 +107,11 @@ mod tests {
             (Key::DashCfg, "monitoring"),
             (Key::Health, "monitoring"),
             
-            (Key::Version, "misc"),
-            (Key::Feature(Bytes::from_slice(&[7, 8, 9])), "misc"),
-            (Key::TempData(Bytes::from_slice(&[10, 11, 12])), "misc"),
-            (Key::MigStat, "misc"),
+            (StorageKey::ContractVersion, "misc"),
+            (StorageKey::FeatureFlag(Bytes::from_slice(&[7, 8, 9])), "misc"),
+            (StorageKey::TemporaryData(Bytes::from_slice(&[10, 11, 12])), "misc"),
+            (StorageKey::MigrationStatus, "misc"),
+            (StorageKey::ProtocolPauseReason, "misc"),
         ];
 
         for (key, expected_namespace) in test_cases {
@@ -124,18 +129,20 @@ mod tests {
     fn test_storage_key_descriptions() {
         // Test that all keys have non-empty descriptions
         let keys = vec![
-            Key::Admin,
-            Key::Grant(123),
-            Key::RecipGnt(Address::random()),
-            Key::Config,
-            Key::Proposal(456),
-            Key::LastPric,
-            Key::AudTxCnt,
-            Key::WrapAst(Address::random()),
-            Key::EmergSig,
-            Key::ReentGd,
-            Key::LastHb,
-            Key::Version,
+            StorageKey::Admin,
+            StorageKey::Grant(123),
+            StorageKey::RecipientGrants(Address::random()),
+            StorageKey::TreasuryConfig,
+            StorageKey::Proposal(456),
+            StorageKey::LastOraclePrice,
+            StorageKey::AuditTxCounter,
+            StorageKey::ClaimValue(1, 1),
+            StorageKey::Sep38DefaultFiat,
+            StorageKey::WrappedAsset(Address::random()),
+            StorageKey::EmergencySigners,
+            StorageKey::ReentrancyGuard,
+            StorageKey::LastHeartbeat,
+            StorageKey::ContractVersion,
         ];
 
         for key in keys {

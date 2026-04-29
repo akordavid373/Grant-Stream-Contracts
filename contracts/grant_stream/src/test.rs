@@ -1,9 +1,10 @@
 #![cfg(test)]
 
 use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, SCALING_FACTOR};
+use std::println;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env,
+    token, Address, Env, Symbol,
 };
 
 fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantStreamContractClient) {
@@ -47,7 +48,7 @@ fn test_pipeline() {
     // Mint tokens to contract for payout
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None, &None);
 }
 
 #[test]
@@ -64,11 +65,11 @@ fn test_is_active_grantee_basic_functionality() {
     assert!(!client.is_active_grantee(&no_grants_user), "User with no grants should return false");
     
     // Test 2: Create an active grant
-    client.create_grant(&1u64, &active_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&1u64, &active_grantee, &1000000i128, &100i128, &0u64, &None, &None);
     assert!(client.is_active_grantee(&active_grantee), "User with active grant should return true");
     
     // Test 3: Create a completed grant
-    client.create_grant(&2u64, &inactive_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&2u64, &inactive_grantee, &1000000i128, &100i128, &0u64, &None, &None);
     // Simulate completion by withdrawing all funds
     set_timestamp(&env, 20000); // Allow some streaming
     let claimable = client.claimable(&2u64);
@@ -76,6 +77,45 @@ fn test_is_active_grantee_basic_functionality() {
         // For testing, we'll manually set the status to completed
         // In real scenarios, this would happen through normal flow
     }
+}
+
+#[test]
+fn test_current_claimable_amounts_are_previewed_without_storage_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let validator = Address::generate(&env);
+    let grant_id = 1u64;
+    let total_amount = 1000 * SCALING_FACTOR;
+    let flow_rate = 1 * SCALING_FACTOR;
+
+    set_timestamp(&env, 100);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0u64, &Some(validator.clone()));
+    set_timestamp(&env, 110);
+
+    let (claimable, validator_claimable) = client.get_current_claimable_amounts(&grant_id).unwrap();
+    assert_eq!(claimable, 95 * SCALING_FACTOR);
+    assert_eq!(validator_claimable, 5 * SCALING_FACTOR);
+
+    let stored_grant = client.get_grant(&grant_id).unwrap();
+    assert_eq!(stored_grant.claimable, 0, "Preview query should not mutate stored grant state");
+    assert_eq!(stored_grant.validator_claimable, 0, "Preview query should not mutate stored grant state");
+}
+
+#[test]
+fn test_get_health_factor_is_read_only_preview() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let grant_id = 1u64;
+    let recipient = Address::generate(&env);
+
+    client.create_grant(&grant_id, &recipient, &100_000i128, &1_000i128, &0u64, &None);
+    env.storage().instance().set(&super::storage_keys::StorageKey::ReserveBalance, &100_000i128);
+
+    let health = client.get_health_factor().unwrap();
+    assert_eq!(health, 9000, "Health factor should reflect the current reserve and liabilities without mutating state");
 }
 
 #[test]
@@ -101,13 +141,13 @@ fn test_is_active_grantee_with_different_statuses() {
     assert!(client.is_active_grantee(&active_grantee), "Active grantee should return true");
     
     // Pause grant 2 (should still return true - paused is considered active)
-    client.pause_stream(&2u64);
+    client.pause_stream(&2u64, &None);
     assert!(client.is_active_grantee(&paused_grantee), "Paused grantee should return true");
     
     // Complete grant 3 (should return false)
     // For testing, we'll simulate completion by setting status directly
     // In production, this would happen through normal grant lifecycle
-    let grant = client.get_grant(&3u64).unwrap();
+    let grant = client.get_grant(&3u64);
     // Note: In real implementation, you'd need to use admin functions to complete grants
     
     // Cancel grant 4 (should return false)
@@ -115,7 +155,7 @@ fn test_is_active_grantee_with_different_statuses() {
     assert!(!client.is_active_grantee(&cancelled_grantee), "Cancelled grantee should return false");
     
     // Note: Rage quit requires grant to be paused first
-    client.pause_stream(&5u64);
+    client.pause_stream(&5u64, &None);
     client.rage_quit(&5u64);
     assert!(!client.is_active_grantee(&ragequit_grantee), "Rage quit grantee should return false");
 }
@@ -162,13 +202,13 @@ fn test_is_active_grantee_performance() {
     }
     
     // Measure CPU instructions for multiple calls
-    let before_cpu = env.budget().cpu_instruction_count();
+    let before_cpu = env.budget().cpu_instruction_cost();
     
     for _ in 0..100 {
         let _ = client.is_active_grantee(&test_user);
     }
     
-    let after_cpu = env.budget().cpu_instruction_count();
+    let after_cpu = env.budget().cpu_instruction_cost();
     let total_cpu = after_cpu - before_cpu;
     let avg_cpu_per_call = total_cpu / 100;
     
@@ -197,29 +237,6 @@ fn test_is_active_grantee_archived_data() {
     // Test with user who had grants but all are now completed/cancelled
     // This simulates the "stale records" edge case
 }
-
-    // 2. Advance time and check claimable
-    set_timestamp(&env, 1010); // 10 seconds later
-    assert_eq!(client.claimable(&grant_id), 10 * SCALING_FACTOR);
-
-    // 3. Withdraw
-    client.withdraw(&grant_id, &(5 * SCALING_FACTOR));
-    assert_eq!(grant_token.balance(&recipient), 5 * SCALING_FACTOR);
-    assert_eq!(client.claimable(&grant_id), 5 * SCALING_FACTOR);
-
-    // 4. Propose Rate Increase (Timelocked)
-    let new_rate = 2 * SCALING_FACTOR;
-    client.propose_rate_change(&grant_id, &new_rate);
-    
-    let grant = client.get_grant(&grant_id);
-    assert_eq!(grant.pending_rate, new_rate);
-    assert_eq!(grant.effective_timestamp, 1010 + 48 * 60 * 60);
-
-    // 5. Advance time past timelock
-    set_timestamp(&env, 1010 + 48 * 60 * 60 + 10);
-    assert_eq!(client.claimable(&grant_id), 172825 * SCALING_FACTOR);
-}
-
 #[test]
 fn test_warmup() {
     let env = Env::default();
@@ -255,7 +272,7 @@ fn test_rage_quit() {
     client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
     
     set_timestamp(&env, 1100); // 100 tokens accrued
-    client.pause_stream(&grant_id);
+    client.pause_stream(&grant_id, &None);
     
     client.rage_quit(&grant_id);
     
@@ -296,10 +313,70 @@ fn test_validator_split_basic() {
 
     client.create_grant(
         &grant_id, &recipient, &total_amount, &flow_rate, &0,
-        &Some(validator.clone()),
+        &Some(validator.clone()), &None,
     );
 
     set_timestamp(&env, 1100);
     assert_eq!(client.claimable(&grant_id), 95 * SCALING_FACTOR);
     assert_eq!(client.validator_claimable(&grant_id), 5 * SCALING_FACTOR);
+}
+
+#[test]
+fn test_withdraw_below_minimum_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    // Flow rate: 0.5 USDC/sec — claimable after 1 sec is 0.5 USDC < 1 USDC minimum
+    let flow_rate = SCALING_FACTOR / 2;
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0, &None);
+
+    set_timestamp(&env, 1001); // only 0.5 USDC accrued
+    let result = client.try_withdraw(&grant_id, &flow_rate);
+    assert_eq!(result, Err(Ok(Error::WithdrawalBelowMinimum)));
+}
+
+#[test]
+fn test_withdraw_at_minimum_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    // Flow rate: 1 USDC/sec — claimable after 1 sec is exactly 1 USDC
+    let flow_rate = MIN_WITHDRAWAL;
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0, &None);
+
+    set_timestamp(&env, 1001); // exactly MIN_WITHDRAWAL accrued
+    client.withdraw(&grant_id, &MIN_WITHDRAWAL);
+}
+
+#[test]
+fn test_withdraw_above_minimum_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let total_amount = 1_000_000 * SCALING_FACTOR;
+    let flow_rate = 5 * SCALING_FACTOR; // 5 USDC/sec
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &0, &None);
+
+    set_timestamp(&env, 1010); // 50 USDC accrued >> minimum
+    client.withdraw(&grant_id, &(50 * SCALING_FACTOR));
 }
