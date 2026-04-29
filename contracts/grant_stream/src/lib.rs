@@ -201,6 +201,12 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     Ok(total)
 }
 
+fn preview_grant_at_now(grant: &Grant, now: u64) -> Result<Grant, Error> {
+    let mut preview = grant.clone();
+    settle_grant(&mut preview, now)?;
+    Ok(preview)
+}
+
 fn count_active_grants(env: &Env) -> u32 {
     let mut count = 0_u32;
     let ids = read_grant_ids(env);
@@ -923,6 +929,25 @@ impl GrantStreamContract {
         }
     }
 
+    /// Current claimable values for a grant without mutating storage.
+    pub fn get_current_claimable_amounts(env: Env, grant_id: u64) -> Result<(i128, i128), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        let preview = preview_grant_at_now(&grant, env.ledger().timestamp())?;
+        Ok((preview.claimable, preview.validator_claimable))
+    }
+
+    /// Current grantee claimable amount without mutating storage.
+    pub fn get_current_grantee_claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
+        let (claimable, _) = Self::get_current_claimable_amounts(env, grant_id)?;
+        Ok(claimable)
+    }
+
+    /// Current validator claimable amount without mutating storage.
+    pub fn get_current_validator_claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
+        let (_, validator_claimable) = Self::get_current_claimable_amounts(env, grant_id)?;
+        Ok(validator_claimable)
+    }
+
     /// Compute the claimable balance for exponential vesting.
     pub fn compute_exponential_vesting(
         total: u128,
@@ -1196,10 +1221,10 @@ impl GrantStreamContract {
         Ok(data)
     }
 
+    /// Get the current protocol health factor in basis points without mutating on-chain state.
     pub fn get_health_factor(env: Env) -> Result<i128, Error> {
         let liabilities = total_allocated_funds(&env)?;
-        // Call yield_treasury module implementation
-        match yield_treasury::YieldTreasuryContract::calculate_pool_health(env, liabilities) {
+        match yield_treasury::YieldTreasuryContract::preview_pool_health(env, liabilities) {
             Ok(hf) => Ok(hf),
             Err(_) => Err(Error::MathOverflow), // Map to generic error for simplicity
         }
