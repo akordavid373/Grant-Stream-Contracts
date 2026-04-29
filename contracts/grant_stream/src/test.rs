@@ -47,7 +47,7 @@ fn test_pipeline() {
     // Mint tokens to contract for payout
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None);
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None, &None);
 }
 
 #[test]
@@ -64,11 +64,11 @@ fn test_is_active_grantee_basic_functionality() {
     assert!(!client.is_active_grantee(&no_grants_user), "User with no grants should return false");
     
     // Test 2: Create an active grant
-    client.create_grant(&1u64, &active_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&1u64, &active_grantee, &1000000i128, &100i128, &0u64, &None, &None);
     assert!(client.is_active_grantee(&active_grantee), "User with active grant should return true");
     
     // Test 3: Create a completed grant
-    client.create_grant(&2u64, &inactive_grantee, &1000000i128, &100i128, &0u64, &None);
+    client.create_grant(&2u64, &inactive_grantee, &1000000i128, &100i128, &0u64, &None, &None);
     // Simulate completion by withdrawing all funds
     set_timestamp(&env, 20000); // Allow some streaming
     let claimable = client.claimable(&2u64);
@@ -335,7 +335,7 @@ fn test_validator_split_basic() {
 
     client.create_grant(
         &grant_id, &recipient, &total_amount, &flow_rate, &0,
-        &Some(validator.clone()),
+        &Some(validator.clone()), &None,
     );
 
     set_timestamp(&env, 1100);
