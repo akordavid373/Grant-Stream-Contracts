@@ -1868,7 +1868,21 @@ impl GrantStreamContract {
             return Err(Error::InvalidNonce);
         }
 
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        native_client.transfer(
+            &grant.recipient,
+            &env.current_contract_address(),
+            &MILESTONE_SUBMISSION_DEPOSIT_XLM,
+        );
+
         env.storage().persistent().set(&milestone_key, &proof);
+        set_milestone_submission_deposit(
+            &env,
+            grant_id,
+            milestone_index,
+            MILESTONE_SUBMISSION_DEPOSIT_XLM,
+        );
 
         let next_nonce = nonce.checked_add(1).ok_or(Error::MathOverflow)?;
         write_expected_milestone_nonce(&env, grant_id, next_nonce);
@@ -1878,6 +1892,52 @@ impl GrantStreamContract {
             (grant_id, milestone_index, nonce),
         );
 
+        Ok(())
+    }
+
+    /// Admin-only: approve a milestone submission and refund its anti-spam deposit.
+    pub fn approve_milestone_submission(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let grant = read_grant(&env, grant_id)?;
+        let deposit = get_milestone_submission_deposit(&env, grant_id, milestone_index)
+            .ok_or(Error::SubmissionDepositNotFound)?;
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        native_client.transfer(&env.current_contract_address(), &grant.recipient, &deposit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::MilestoneSubmissionDeposit(grant_id, milestone_index));
+        env.events().publish(
+            (symbol_short!("mil_depr"),),
+            (grant_id, milestone_index, deposit),
+        );
+        Ok(())
+    }
+
+    /// Admin-only: slash a fraudulent milestone submission deposit to treasury.
+    pub fn slash_milestone_submission_deposit(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let deposit = get_milestone_submission_deposit(&env, grant_id, milestone_index)
+            .ok_or(Error::SubmissionDepositNotFound)?;
+        let treasury = read_treasury(&env)?;
+        let native_token_addr: Address = env.storage().instance().get(&StorageKey::NativeToken).ok_or(Error::NotInitialized)?;
+        let native_client = token::Client::new(&env, &native_token_addr);
+        native_client.transfer(&env.current_contract_address(), &treasury, &deposit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::MilestoneSubmissionDeposit(grant_id, milestone_index));
+        env.events().publish(
+            (symbol_short!("mil_deps"),),
+            (grant_id, milestone_index, deposit),
+        );
         Ok(())
     }
 
