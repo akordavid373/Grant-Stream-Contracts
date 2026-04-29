@@ -29,10 +29,12 @@ pub mod public_dashboard;
 pub mod tax_reporting;
 pub mod audit_log;
 pub mod multi_threshold;
-pub mod double_approval;
+pub mod security_council;
 
 #[cfg(all(test, feature = "legacy-tests"))]
 mod test_dispute_circuit_breaker;
+#[cfg(test)]
+mod test_security_council;
 
 #[cfg(test)]
 mod test_matching_pool;
@@ -1823,170 +1825,182 @@ impl GrantStreamContract {
         false
     }
 
-    // ── Double-Approval System for High-Value Milestone Payouts ───────────────
+    // ── Security Council: Governance Attack Protection ────────────────────────
 
-    /// Initialize double-approval configuration (admin only)
-    pub fn initialize_double_approval(
+    /// Initialize the Security Council with 5 members (3-of-5 multi-sig).
+    /// Admin only. This provides a final layer of defense against governance attacks.
+    pub fn initialize_security_council(
         env: Env,
-        primary_approver: Address,
-        secondary_approver: Address,
-        high_value_threshold: Option<i128>,
-        approval_window_secs: Option<u64>,
+        members: Vec<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
-        double_approval::initialize_config(
-            &env,
-            primary_approver,
-            secondary_approver,
-            high_value_threshold,
-            approval_window_secs,
-        )
+        security_council::SecurityCouncil::initialize_council(env, members)
+            .map_err(|_| Error::NotAuthorized)
     }
 
-    /// Update double-approval configuration (admin only)
-    pub fn update_double_approval_config(
+    /// Create a pending governance action with 48-hour timelock.
+    /// Used for sensitive operations like clawbacks, emergency pauses, etc.
+    /// During the timelock window, the Security Council can veto the action.
+    pub fn create_timelocked_action(
         env: Env,
-        high_value_threshold: Option<i128>,
-        approval_window_secs: Option<u64>,
-        enabled: Option<bool>,
-    ) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-        double_approval::update_config(
-            &env,
-            high_value_threshold,
-            approval_window_secs,
-            enabled,
-        )
-    }
-
-    /// Get current double-approval configuration
-    pub fn get_double_approval_config(env: Env) -> Result<double_approval::DoubleApprovalConfig, Error> {
-        double_approval::get_config(&env)
-    }
-
-    /// Create a double-approval request for a high-value milestone payout
-    pub fn create_double_approval_request(
-        env: Env,
-        grant_id: u64,
-        milestone_index: u32,
-        amount: i128,
-        recipient: Address,
-        token_address: Address,
-        reason: Option<String>,
+        action_type: security_council::ActionType,
+        target_grant_id: Option<u64>,
+        initiator: Address,
+        parameters: Vec<i128>,
     ) -> Result<u64, Error> {
         require_admin_auth(&env)?;
-        double_approval::create_request(
-            &env,
-            grant_id,
-            milestone_index,
-            amount,
-            recipient,
-            token_address,
-            reason,
+        security_council::SecurityCouncil::create_pending_action(
+            env,
+            action_type,
+            target_grant_id,
+            initiator,
+            parameters,
         )
+        .map_err(|_| Error::NotAuthorized)
     }
 
-    /// Get a double-approval request
-    pub fn get_double_approval_request(
+    /// Security Council member signs to veto a pending action.
+    /// Requires 3 of 5 signatures to permanently block the action.
+    /// This is the primary defense against rogue DAO attacks.
+    pub fn council_sign_veto(
         env: Env,
-        grant_id: u64,
-        milestone_index: u32,
-    ) -> Result<double_approval::DoubleApprovalRequest, Error> {
-        double_approval::get_request(&env, grant_id, milestone_index)
-    }
-
-    /// Approve a double-approval request
-    pub fn approve_double_approval_request(
-        env: Env,
-        grant_id: u64,
-        milestone_index: u32,
-        approver: Address,
+        action_id: u64,
+        signer: Address,
     ) -> Result<(), Error> {
-        approver.require_auth();
-        double_approval::approve_request(&env, grant_id, milestone_index, approver)
+        security_council::SecurityCouncil::sign_veto(env, action_id, signer)
+            .map_err(|_| Error::NotAuthorized)
     }
 
-    /// Execute a fully approved double-approval request
-    pub fn execute_double_approval_request(
+    /// Execute a timelocked action after 48 hours if not vetoed.
+    /// This completes the governance action if the Security Council
+    /// did not intervene during the timelock period.
+    pub fn execute_timelocked_action(
         env: Env,
-        grant_id: u64,
-        milestone_index: u32,
-        executor: Address,
+        action_id: u64,
     ) -> Result<(), Error> {
-        executor.require_auth();
-        double_approval::execute_request(&env, grant_id, milestone_index, executor)
+        security_council::SecurityCouncil::execute_action(env, action_id)
+            .map_err(|_| Error::NotAuthorized)
     }
 
-    /// Cancel a double-approval request (admin only)
-    pub fn cancel_double_approval_request(
+    /// Check if a timelocked action can be executed.
+    pub fn can_execute_timelocked_action(
         env: Env,
-        grant_id: u64,
-        milestone_index: u32,
-        canceller: Address,
+        action_id: u64,
+    ) -> Result<bool, Error> {
+        security_council::SecurityCouncil::can_execute_action(env, action_id)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Propose new Security Council members (requires DAO approval).
+    /// Council keys must be rotated annually via 7-day timelock.
+    pub fn propose_council_rotation(
+        env: Env,
+        new_members: Vec<Address>,
+        dao_admin: Address,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
-        double_approval::cancel_request(&env, grant_id, milestone_index, canceller)
+        security_council::SecurityCouncil::propose_council_rotation(
+            env,
+            new_members,
+            dao_admin,
+        )
+        .map_err(|_| Error::NotAuthorized)
     }
 
-    /// Check if an amount requires double approval
-    pub fn requires_double_approval(env: Env, amount: i128) -> Result<bool, Error> {
-        double_approval::requires_double_approval(&env, amount)
+    /// Execute council rotation after 7-day DAO-approved timelock.
+    pub fn execute_council_rotation(env: Env) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        security_council::SecurityCouncil::execute_council_rotation(env)
+            .map_err(|_| Error::NotAuthorized)
     }
 
-    /// Check if a milestone has a pending double-approval request
-    pub fn has_double_approval_request(env: Env, grant_id: u64, milestone_index: u32) -> bool {
-        double_approval::has_request(&env, grant_id, milestone_index)
+    /// Check if annual council rotation is due.
+    pub fn is_council_rotation_due(env: Env) -> bool {
+        security_council::SecurityCouncil::is_rotation_due(env)
     }
 
-    /// Enhanced milestone claim function with double-approval integration
-    pub fn claim_milestone_with_double_approval(
+    /// Get current Security Council members.
+    pub fn get_council_members(env: Env) -> Result<Vec<Address>, Error> {
+        security_council::SecurityCouncil::get_council_members(env)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Get details of a pending timelocked action.
+    pub fn get_pending_action(
+        env: Env,
+        action_id: u64,
+    ) -> Result<security_council::PendingAction, Error> {
+        security_council::SecurityCouncil::get_pending_action(env, action_id)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Get the number of veto signatures for an action.
+    pub fn get_veto_signature_count(env: Env, action_id: u64) -> u32 {
+        security_council::SecurityCouncil::get_veto_count(env, action_id)
+    }
+
+    /// Get all pending action IDs.
+    pub fn get_all_pending_actions(env: Env) -> Vec<u64> {
+        security_council::SecurityCouncil::get_pending_action_ids(env)
+    }
+
+    /// Protected clawback with Security Council oversight.
+    /// Creates a timelocked action that can be vetoed by the council.
+    /// This prevents rogue DAO attacks on grant funds.
+    pub fn protected_clawback(
         env: Env,
         grant_id: u64,
-        milestone_index: u32,
-        amount: i128,
+        initiator: Address,
+    ) -> Result<u64, Error> {
+        require_admin_auth(&env)?;
+        
+        // Create timelocked action for clawback
+        let mut params = Vec::new(&env);
+        params.push_back(grant_id as i128);
+        
+        let action_id = security_council::SecurityCouncil::create_pending_action(
+            env.clone(),
+            security_council::ActionType::Clawback,
+            Some(grant_id),
+            initiator.clone(),
+            params,
+        )
+        .map_err(|_| Error::NotAuthorized)?;
+
+        env.events().publish(
+            (symbol_short!("clawback_pending"), initiator, grant_id),
+            action_id,
+        );
+
+        Ok(action_id)
+    }
+
+    /// Execute a vetted clawback after timelock expires.
+    /// Can only be called if Security Council did not veto.
+    pub fn execute_protected_clawback(
+        env: Env,
+        action_id: u64,
+        grant_id: u64,
     ) -> Result<(), Error> {
-        let grant = read_grant(&env, grant_id)?;
-        grant.recipient.require_auth();
+        require_admin_auth(&env)?;
 
-        // Check if amount requires double approval
-        if double_approval::requires_double_approval(&env, amount)? {
-            // Check if there's already a fully approved request
-            if let Ok(request) = double_approval::get_request(&env, grant_id, milestone_index) {
-                if request.status == double_approval::ApprovalStatus::FullyApproved 
-                    && request.amount == amount 
-                    && request.recipient == grant.recipient {
-                    // Execute the approved request
-                    return double_approval::execute_request(&env, grant_id, milestone_index, grant.recipient);
-                }
-            }
-            
-            // No approved request found, return error
-            return Err(Error::DoubleApprovalRequired);
-        } else {
-            // Amount doesn't require double approval, proceed with normal claim
-            // This would integrate with the existing claim_milestone_funds function
-            // For now, we'll implement a simplified version
-            if amount > grant.claimable {
-                return Err(Error::InvalidAmount);
-            }
+        // Verify action can be executed
+        let can_execute = security_council::SecurityCouncil::can_execute_action(
+            env.clone(),
+            action_id,
+        )
+        .map_err(|_| Error::NotAuthorized)?;
 
-            let mut updated_grant = grant.clone();
-            updated_grant.claimable = updated_grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
-            updated_grant.withdrawn = updated_grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
-            write_grant(&env, grant_id, &updated_grant);
-
-            let token_addr = read_grant_token(&env)?;
-            let client = token::Client::new(&env, &token_addr);
-            client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
-
-            // Emit milestone claim event
-            env.events().publish(
-                (symbol_short!("milestone_claim"),),
-                (grant_id, milestone_index, amount, grant.recipient),
-            );
-
-            Ok(())
+        if !can_execute {
+            return Err(Error::InvalidState);
         }
+
+        // Mark action as executed
+        security_council::SecurityCouncil::execute_action(env.clone(), action_id)
+            .map_err(|_| Error::NotAuthorized)?;
+
+        // Perform the actual clawback
+        Self::cancel_grant(env, grant_id)
     }
 }
 
