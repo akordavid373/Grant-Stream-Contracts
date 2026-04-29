@@ -33,9 +33,12 @@ pub mod public_dashboard;
 pub mod tax_reporting;
 pub mod audit_log;
 pub mod multi_threshold;
+pub mod security_council;
 
 #[cfg(test)]
 mod test_dispute_circuit_breaker;
+#[cfg(test)]
+mod test_security_council;
 
 // --- Types ---
 
@@ -1408,6 +1411,184 @@ impl GrantStreamContract {
             }
         }
         false
+    }
+
+    // ── Security Council: Governance Attack Protection ────────────────────────
+
+    /// Initialize the Security Council with 5 members (3-of-5 multi-sig).
+    /// Admin only. This provides a final layer of defense against governance attacks.
+    pub fn initialize_security_council(
+        env: Env,
+        members: Vec<Address>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        security_council::SecurityCouncil::initialize_council(env, members)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Create a pending governance action with 48-hour timelock.
+    /// Used for sensitive operations like clawbacks, emergency pauses, etc.
+    /// During the timelock window, the Security Council can veto the action.
+    pub fn create_timelocked_action(
+        env: Env,
+        action_type: security_council::ActionType,
+        target_grant_id: Option<u64>,
+        initiator: Address,
+        parameters: Vec<i128>,
+    ) -> Result<u64, Error> {
+        require_admin_auth(&env)?;
+        security_council::SecurityCouncil::create_pending_action(
+            env,
+            action_type,
+            target_grant_id,
+            initiator,
+            parameters,
+        )
+        .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Security Council member signs to veto a pending action.
+    /// Requires 3 of 5 signatures to permanently block the action.
+    /// This is the primary defense against rogue DAO attacks.
+    pub fn council_sign_veto(
+        env: Env,
+        action_id: u64,
+        signer: Address,
+    ) -> Result<(), Error> {
+        security_council::SecurityCouncil::sign_veto(env, action_id, signer)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Execute a timelocked action after 48 hours if not vetoed.
+    /// This completes the governance action if the Security Council
+    /// did not intervene during the timelock period.
+    pub fn execute_timelocked_action(
+        env: Env,
+        action_id: u64,
+    ) -> Result<(), Error> {
+        security_council::SecurityCouncil::execute_action(env, action_id)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Check if a timelocked action can be executed.
+    pub fn can_execute_timelocked_action(
+        env: Env,
+        action_id: u64,
+    ) -> Result<bool, Error> {
+        security_council::SecurityCouncil::can_execute_action(env, action_id)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Propose new Security Council members (requires DAO approval).
+    /// Council keys must be rotated annually via 7-day timelock.
+    pub fn propose_council_rotation(
+        env: Env,
+        new_members: Vec<Address>,
+        dao_admin: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        security_council::SecurityCouncil::propose_council_rotation(
+            env,
+            new_members,
+            dao_admin,
+        )
+        .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Execute council rotation after 7-day DAO-approved timelock.
+    pub fn execute_council_rotation(env: Env) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        security_council::SecurityCouncil::execute_council_rotation(env)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Check if annual council rotation is due.
+    pub fn is_council_rotation_due(env: Env) -> bool {
+        security_council::SecurityCouncil::is_rotation_due(env)
+    }
+
+    /// Get current Security Council members.
+    pub fn get_council_members(env: Env) -> Result<Vec<Address>, Error> {
+        security_council::SecurityCouncil::get_council_members(env)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Get details of a pending timelocked action.
+    pub fn get_pending_action(
+        env: Env,
+        action_id: u64,
+    ) -> Result<security_council::PendingAction, Error> {
+        security_council::SecurityCouncil::get_pending_action(env, action_id)
+            .map_err(|_| Error::NotAuthorized)
+    }
+
+    /// Get the number of veto signatures for an action.
+    pub fn get_veto_signature_count(env: Env, action_id: u64) -> u32 {
+        security_council::SecurityCouncil::get_veto_count(env, action_id)
+    }
+
+    /// Get all pending action IDs.
+    pub fn get_all_pending_actions(env: Env) -> Vec<u64> {
+        security_council::SecurityCouncil::get_pending_action_ids(env)
+    }
+
+    /// Protected clawback with Security Council oversight.
+    /// Creates a timelocked action that can be vetoed by the council.
+    /// This prevents rogue DAO attacks on grant funds.
+    pub fn protected_clawback(
+        env: Env,
+        grant_id: u64,
+        initiator: Address,
+    ) -> Result<u64, Error> {
+        require_admin_auth(&env)?;
+        
+        // Create timelocked action for clawback
+        let mut params = Vec::new(&env);
+        params.push_back(grant_id as i128);
+        
+        let action_id = security_council::SecurityCouncil::create_pending_action(
+            env.clone(),
+            security_council::ActionType::Clawback,
+            Some(grant_id),
+            initiator.clone(),
+            params,
+        )
+        .map_err(|_| Error::NotAuthorized)?;
+
+        env.events().publish(
+            (symbol_short!("clawback_pending"), initiator, grant_id),
+            action_id,
+        );
+
+        Ok(action_id)
+    }
+
+    /// Execute a vetted clawback after timelock expires.
+    /// Can only be called if Security Council did not veto.
+    pub fn execute_protected_clawback(
+        env: Env,
+        action_id: u64,
+        grant_id: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        // Verify action can be executed
+        let can_execute = security_council::SecurityCouncil::can_execute_action(
+            env.clone(),
+            action_id,
+        )
+        .map_err(|_| Error::NotAuthorized)?;
+
+        if !can_execute {
+            return Err(Error::InvalidState);
+        }
+
+        // Mark action as executed
+        security_council::SecurityCouncil::execute_action(env.clone(), action_id)
+            .map_err(|_| Error::NotAuthorized)?;
+
+        // Perform the actual clawback
+        Self::cancel_grant(env, grant_id)
     }
 }
 
