@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 
 use super::optimized::{
-    GrantContract, Grant, Error, DataKey, read_grant, write_grant, settle_grant,
+    GrantContract, Grant, Error, read_grant, write_grant, settle_grant,
     STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED,
     has_status, set_status, clear_status, read_admin,
 };
