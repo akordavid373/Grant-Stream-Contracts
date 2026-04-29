@@ -55,6 +55,12 @@ pub enum StorageKey {
     GrantMetrics(u64),
     /// Grant dispute status and resolution data
     GrantDisputeData(u64),
+    /// Grant donor information for clawback authorization
+    GrantDonor(u64),
+    /// Clawback checkpoint data to prevent double-spending
+    ClawbackCheckpoint(u64),
+    /// Dispute escrow balance for contested clawbacks
+    DisputeEscrow(u64),
     
     // ── User Data ───────────────────────────────────────────────────────────────
     
@@ -242,7 +248,10 @@ impl StorageKey {
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
             | StorageKey::GrantMetrics(_)
-            | StorageKey::GrantDisputeData(_) => "grant",
+            | StorageKey::GrantDisputeData(_)
+            | StorageKey::GrantDonor(_)
+            | StorageKey::ClawbackCheckpoint(_)
+            | StorageKey::DisputeEscrow(_) => "grant",
             
             // User Data
             StorageKey::RecipientGrants(_)
@@ -351,6 +360,9 @@ impl StorageKey {
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
             StorageKey::GrantMetrics(_) => "Grant performance metrics",
             StorageKey::GrantDisputeData(_) => "Grant dispute status",
+            StorageKey::GrantDonor(_) => "Grant donor information for clawback",
+            StorageKey::ClawbackCheckpoint(_) => "Clawback checkpoint to prevent double-spending",
+            StorageKey::DisputeEscrow(_) => "Dispute escrow balance for contested clawbacks",
             
             StorageKey::RecipientGrants(_) => "Grants associated with recipient",
             StorageKey::UserBalance(_) => "User balance information",

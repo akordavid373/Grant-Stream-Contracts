@@ -47,6 +47,7 @@ pub enum GrantStatus {
     Completed,
     Cancelled,
     RageQuitted,
+    Clawbacked,
 }
 
 // Import the unified storage keys
@@ -92,21 +93,13 @@ pub struct Grant {
     pub is_legal_signed: bool,
     /// Optional reason string for why the grant was paused
     pub pause_reason: Option<String>,
+    /// Original donor who funded the grant (for clawback authorization)
+    pub donor: Option<Address>,
+    /// Checkpoint timestamp when clawback was executed (to prevent double-spending)
+    pub clawback_checkpoint: Option<u64>,
 }
 
 
-#[contracttype]
-#[derive(Clone)]
-pub struct Grant {
-    pub recipient: Address,
-    pub token: Address,
-    pub total_amount: i128,
-    pub streamed_amount: i128,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub paused: bool,
-    // … other existing fields …
-}
 
 #[contract]
 pub struct GrantStream;
@@ -139,6 +132,10 @@ pub enum Error {
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
+    ClawbackAlreadyExecuted = 20,
+    InvalidClawbackReason = 21,
+    DisputeEscrowNotFound = 22,
+    NotDonorOrMultiSig = 23,
 }
 
 // --- Internal Helpers ---
@@ -213,6 +210,44 @@ fn count_active_grants(env: &Env) -> u32 {
         }
     }
     count
+}
+
+fn require_donor_or_multisig_auth(env: &Env, grant: &Grant) -> Result<(), Error> {
+    match &grant.donor {
+        Some(donor) => {
+            donor.require_auth();
+            Ok(())
+        }
+        None => {
+            // If no donor is set, require admin authorization (DAO multi-sig)
+            require_admin_auth(env)
+        }
+    }
+}
+
+fn calculate_unearned_balance(grant: &Grant) -> Result<i128, Error> {
+    let total_earned = grant.withdrawn
+        .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+    
+    grant.total_amount.checked_sub(total_earned).ok_or(Error::MathOverflow)
+}
+
+fn set_clawback_checkpoint(env: &Env, grant_id: u64, timestamp: u64) {
+    env.storage().instance().set(&StorageKey::ClawbackCheckpoint(grant_id), &timestamp);
+}
+
+fn get_clawback_checkpoint(env: &Env, grant_id: u64) -> Option<u64> {
+    env.storage().instance().get(&StorageKey::ClawbackCheckpoint(grant_id))
+}
+
+fn set_dispute_escrow(env: &Env, grant_id: u64, amount: i128) {
+    env.storage().instance().set(&StorageKey::DisputeEscrow(grant_id), &amount);
+}
+
+fn get_dispute_escrow(env: &Env, grant_id: u64) -> Option<i128> {
+    env.storage().instance().get(&StorageKey::DisputeEscrow(grant_id))
 }
 
 fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
@@ -481,6 +516,7 @@ impl GrantStreamContract {
         flow_rate: i128,
         warmup_duration: u64,
         validator: Option<Address>,
+        donor: Option<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
@@ -522,6 +558,8 @@ impl GrantStreamContract {
             requires_legal_signature: false,
             is_legal_signed: false,
             pause_reason: None,
+            donor: donor.clone(),
+            clawback_checkpoint: None,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -804,6 +842,162 @@ impl GrantStreamContract {
         }
 
         Ok(())
+    }
+
+    /// Trigger clawback of unearned funds from a grant.
+    /// Restricted to the original donor or DAO multi-sig.
+    /// Calculates unearned balance and instantly terminates the stream.
+    pub fn trigger_grant_clawback(
+        env: Env,
+        grant_id: u64,
+        reason: String,
+        contested: bool,
+    ) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Check if clawback has already been executed
+        if grant.status == GrantStatus::Clawbacked {
+            return Err(Error::ClawbackAlreadyExecuted);
+        }
+        
+        // Only allow clawback for active or paused grants
+        if grant.status != GrantStatus::Active && grant.status != GrantStatus::Paused {
+            return Err(Error::InvalidState);
+        }
+        
+        // Validate reason is not empty
+        if reason.is_empty() {
+            return Err(Error::InvalidClawbackReason);
+        }
+        
+        // Require authorization from donor or DAO multi-sig
+        require_donor_or_multisig_auth(&env, &grant)?;
+        
+        let now = env.ledger().timestamp();
+        
+        // Set checkpoint to prevent double-spending during this operation
+        set_clawback_checkpoint(&env, grant_id, now);
+        grant.clawback_checkpoint = Some(now);
+        
+        // Settle grant up to the exact millisecond of clawback
+        settle_grant(&mut grant, now)?;
+        
+        // Calculate unearned balance (Total_Grant - Amount_Already_Streamed_To_Date)
+        let unearned_balance = calculate_unearned_balance(&grant)?;
+        
+        if unearned_balance <= 0 {
+            // No unearned funds to clawback, but still mark as clawbacked
+            grant.status = GrantStatus::Clawbacked;
+            write_grant(&env, grant_id, &grant);
+            
+            // Emit event even if no funds were clawed back
+            let admin = read_admin(&env)?;
+            let grant_token = read_grant_token(&env)?;
+            env.events().publish(
+                (symbol_short!("clawback"), grant.recipient.clone(), admin, grant_token, grant_id),
+                (0, reason, contested),
+            );
+            return Ok(());
+        }
+        
+        // Ensure grantee can claim any funds already vested up to this exact second
+        let vested_amount = grant.claimable;
+        let validator_vested = grant.validator_claimable;
+        
+        // Transfer unearned balance based on contest status
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        
+        if contested {
+            // Move funds to dispute escrow instead of donor's wallet
+            set_dispute_escrow(&env, grant_id, unearned_balance);
+            
+            // Emit event for disputed clawback
+            let admin = read_admin(&env)?;
+            env.events().publish(
+                (symbol_short!("clawback"), grant.recipient.clone(), admin, token_addr, grant_id),
+                (unearned_balance, reason.clone(), true),
+            );
+        } else {
+            // Return unearned balance to donor's vault
+            let donor_address = grant.donor.clone().ok_or(Error::NotDonorOrMultiSig)?;
+            client.transfer(&env.current_contract_address(), &donor_address, &unearned_balance);
+            
+            // Emit event for successful clawback
+            let admin = read_admin(&env)?;
+            env.events().publish(
+                (symbol_short!("clawback"), grant.recipient.clone(), admin, token_addr, grant_id),
+                (unearned_balance, reason.clone(), false),
+            );
+        }
+        
+        // Mark grant as clawbacked
+        grant.status = GrantStatus::Clawbacked;
+        write_grant(&env, grant_id, &grant);
+        
+        Ok(())
+    }
+
+    /// Resolve a disputed clawback by releasing escrowed funds to the appropriate party
+    pub fn resolve_disputed_clawback(
+        env: Env,
+        grant_id: u64,
+        release_to_donor: bool, // true = release to donor, false = return to grant
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Clawbacked {
+            return Err(Error::InvalidState);
+        }
+        
+        let escrow_amount = get_dispute_escrow(&env, grant_id)
+            .ok_or(Error::DisputeEscrowNotFound)?;
+        
+        if escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        
+        if release_to_donor {
+            // Release to donor
+            let donor_address = grant.donor.clone().ok_or(Error::NotDonorOrMultiSig)?;
+            client.transfer(&env.current_contract_address(), &donor_address, &escrow_amount);
+        } else {
+            // Return to grant (resume streaming to grantee)
+            let mut updated_grant = grant.clone();
+            updated_grant.status = GrantStatus::Active;
+            updated_grant.last_update_ts = env.ledger().timestamp();
+            
+            // Add escrowed amount back to total available for streaming
+            updated_grant.total_amount = updated_grant.total_amount
+                .checked_add(escrow_amount).ok_or(Error::MathOverflow)?;
+            
+            write_grant(&env, grant_id, &updated_grant);
+            
+            // Transfer to treasury to fund the resumed grant
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &escrow_amount);
+        }
+        
+        // Clear the escrow
+        env.storage().instance().remove(&StorageKey::DisputeEscrow(grant_id));
+        
+        // Emit resolution event
+        let admin = read_admin(&env)?;
+        env.events().publish(
+            (symbol_short!("claw_resolve"), grant_id, admin),
+            (escrow_amount, release_to_donor),
+        );
+        
+        Ok(())
+    }
+
+    /// Get the current dispute escrow balance for a grant
+    pub fn get_dispute_escrow_balance(env: Env, grant_id: u64) -> Result<i128, Error> {
+        get_dispute_escrow(&env, grant_id).ok_or(Error::DisputeEscrowNotFound)
     }
 
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
@@ -1434,3 +1628,5 @@ mod test_global_invariant_fuzz;
 mod test_security_invariants;
 #[cfg(test)]
 mod is_active_grantee_benchmark;
+#[cfg(test)]
+mod test_clawback;
