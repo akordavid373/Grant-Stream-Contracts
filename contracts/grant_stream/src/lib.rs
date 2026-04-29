@@ -142,16 +142,7 @@ pub enum GrantStreamError {
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
-    AlreadyApproved = 20,
-    NotRegisteredSigner = 21,
-    ProposalNotFound = 22,
-    ProposalNotPending = 23,
-    InsufficientApprovals = 24,
-    NotSanityOracle = 25,
-    MilestoneNotReady = 26,
-    FundsLocked = 27,
-    InvalidSignature = 28,
-    RentPreservationMode = 29,
+    InvalidNonce = 20,
 }
 
 pub type Error = GrantStreamError;
@@ -197,6 +188,19 @@ fn read_grant_ids(env: &Env) -> Vec<u64> {
         .instance()
         .get(&StorageKey::GrantIds)
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_expected_milestone_nonce(env: &Env, grant_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneSubmitNonce(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_expected_milestone_nonce(env: &Env, grant_id: u64, next_nonce: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MilestoneSubmitNonce(grant_id), &next_nonce);
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -1235,6 +1239,55 @@ impl GrantStreamContract {
         Ok(())
     }
 
+    /// Submit an off-chain milestone proof with monotonic nonce protection.
+    ///
+    /// Replay prevention:
+    /// - Every grant tracks an expected nonce starting at 0.
+    /// - Submission is accepted only when `nonce == expected_nonce`.
+    /// - The expected nonce is incremented after a successful write.
+    ///
+    /// Cancellation edge case:
+    /// - Cancelled / rage-quit / completed grants reject new milestone proofs.
+    pub fn submit_milestone_proof(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        proof: Symbol,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status == GrantStatus::Cancelled
+            || grant.status == GrantStatus::RageQuitted
+            || grant.status == GrantStatus::Completed
+        {
+            return Err(Error::InvalidState);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_index);
+        if env.storage().persistent().has(&milestone_key) {
+            return Err(Error::InvalidState);
+        }
+
+        let expected_nonce = read_expected_milestone_nonce(&env, grant_id);
+        if nonce != expected_nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        env.storage().persistent().set(&milestone_key, &proof);
+
+        let next_nonce = nonce.checked_add(1).ok_or(Error::MathOverflow)?;
+        write_expected_milestone_nonce(&env, grant_id, next_nonce);
+
+        env.events().publish(
+            (symbol_short!("mil_sub"),),
+            (grant_id, milestone_index, nonce),
+        );
+
+        Ok(())
+    }
+
     pub fn emit_grant_status(env: Env, grant_id: u64) -> Result<soroban_sdk::Bytes, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         settle_grant(&mut grant, env.ledger().timestamp())?;
@@ -1275,6 +1328,19 @@ impl GrantStreamContract {
         // 2. Must have no pending claims
         if grant.claimable > 0 || grant.validator_claimable > 0 {
             return Err(Error::GrantNotPurgeable);
+        }
+
+        // 3. Completed grants must be fully accounted before deletion.
+        // This prevents accidental state deletion if any user funds are still
+        // represented in grant accounting due to an upstream bug.
+        if grant.status == GrantStatus::Completed {
+            let accounted = grant.withdrawn
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            if accounted != grant.total_amount {
+                return Err(Error::GrantNotPurgeable);
+            }
         }
 
         // Cleanup state: Remove grant from storage
