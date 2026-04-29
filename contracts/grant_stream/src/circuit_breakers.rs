@@ -65,7 +65,7 @@ pub fn record_oracle_price(env: &Env, new_price: i128) -> bool {
     let last: i128 = env
         .storage()
         .instance()
-        .get(&StorageKey::LastOraclePrice)
+        .get(&StorageKey::LastPric)
         .unwrap_or(0);
 
     if last > 0 {
@@ -80,7 +80,7 @@ pub fn record_oracle_price(env: &Env, new_price: i128) -> bool {
             // Trip the circuit breaker — do NOT update the stored price yet.
             env.storage()
                 .instance()
-                .set(&StorageKey::OracleFrozen, &true);
+                .set(&StorageKey::OraFrozen, &true);
             return false; // price rejected; guard tripped
         }
     }
@@ -88,10 +88,10 @@ pub fn record_oracle_price(env: &Env, new_price: i128) -> bool {
     // Price is within acceptable range — store it and ensure guard is clear.
     env.storage()
         .instance()
-        .set(&StorageKey::LastOraclePrice, &new_price);
+        .set(&StorageKey::LastPric, &new_price);
     env.storage()
         .instance()
-        .set(&StorageKey::OracleFrozen, &false);
+        .set(&StorageKey::OraFrozen, &false);
     true
 }
 
@@ -101,7 +101,7 @@ pub fn confirm_oracle_price(env: &Env, caller: &Address, confirmed_price: i128) 
     let sanity_oracle: Address = env
         .storage()
         .instance()
-        .get(&StorageKey::SanityOracle)
+        .get(&StorageKey::SanityOra)
         .expect("SanityOracle not configured");
     if *caller != sanity_oracle {
         panic!("confirm_oracle_price: caller is not the sanity oracle");
@@ -110,21 +110,21 @@ pub fn confirm_oracle_price(env: &Env, caller: &Address, confirmed_price: i128) 
 
     env.storage()
         .instance()
-        .set(&StorageKey::LastOraclePrice, &confirmed_price);
+        .set(&StorageKey::LastPric, &confirmed_price);
     env.storage()
         .instance()
-        .set(&StorageKey::OracleFrozen, &false);
+        .set(&StorageKey::OraFrozen, &false);
 }
 
 /// Returns `true` when the oracle price circuit breaker is active (frozen).
 pub fn is_oracle_frozen(env: &Env) -> bool {
     env.storage()
         .instance()
-        .get(&StorageKey::OracleFrozen)
+        .get(&StorageKey::OraFrozen)
         .unwrap_or(false) ||
     env.storage()
         .instance()
-        .get(&StorageKey::OracleFrozenDueToNoHeartbeat)
+        .get(&StorageKey::OraFrozenDueToNoHeartbeat)
         .unwrap_or(false)
 }
 
@@ -133,7 +133,7 @@ pub fn is_oracle_frozen(env: &Env) -> bool {
 pub fn set_sanity_oracle(env: &Env, sanity_oracle: &Address) {
     env.storage()
         .instance()
-        .set(&StorageKey::SanityOracle, sanity_oracle);
+        .set(&StorageKey::SanityOra, sanity_oracle);
 }
 
 // ── Oracle Heartbeat and Manual Revert (Emergency Manual Revert for Oracle Freeze) ───────────────────────────────────────────
@@ -143,10 +143,10 @@ pub fn ping_oracle_heartbeat(env: &Env) {
     let now = env.ledger().timestamp();
     env.storage()
         .instance()
-        .set(&StorageKey::OracleLastHeartbeat, &now);
+        .set(&StorageKey::OraHeart, &now);
     env.storage()
         .instance()
-        .set(&StorageKey::OracleFrozenDueToNoHeartbeat, &false);
+        .set(&StorageKey::OraFrozenDueToNoHeartbeat, &false);
 }
 
 /// Check if oracle heartbeat is still valid. If not, freeze.
@@ -154,13 +154,13 @@ pub fn check_oracle_heartbeat(env: &Env) -> bool {
     let last: u64 = env
         .storage()
         .instance()
-        .get(&StorageKey::OracleLastHeartbeat)
+        .get(&StorageKey::OraHeart)
         .unwrap_or(0);
     let current = env.ledger().timestamp();
     if current.saturating_sub(last) > ORACLE_HEARTBEAT_INTERVAL_SECS {
         env.storage()
             .instance()
-            .set(&StorageKey::OracleFrozenDueToNoHeartbeat, &true);
+            .set(&StorageKey::OraFrozenDueToNoHeartbeat, &true);
         false
     } else {
         true
@@ -171,17 +171,17 @@ pub fn check_oracle_heartbeat(env: &Env) -> bool {
 pub fn set_manual_exchange_rate(env: &Env, rate: i128) {
     env.storage()
         .instance()
-        .set(&StorageKey::ManualExchangeRate, &rate);
+        .set(&StorageKey::ManRate, &rate);
     env.storage()
         .instance()
-        .set(&StorageKey::OracleFrozenDueToNoHeartbeat, &false);
+        .set(&StorageKey::OraFrozenDueToNoHeartbeat, &false);
 }
 
 /// Get the manual exchange rate if set.
 pub fn get_manual_exchange_rate(env: &Env) -> Option<i128> {
     env.storage()
         .instance()
-        .get(&StorageKey::ManualExchangeRate)
+        .get(&StorageKey::ManRate)
 }
 
 // ── TVL Velocity Limit (Issue #311) ───────────────────────────────────────────
@@ -192,7 +192,7 @@ pub fn get_manual_exchange_rate(env: &Env) -> Option<i128> {
 pub fn update_tvl_snapshot(env: &Env, total_liquidity: i128) {
     env.storage()
         .instance()
-        .set(&StorageKey::TvlSnapshot, &total_liquidity);
+        .set(&StorageKey::TvlSnap, &total_liquidity);
 }
 
 /// Record a withdrawal of `amount` tokens and check whether the rolling 6-hour
@@ -212,31 +212,31 @@ pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> bool {
     let window_start: u64 = env
         .storage()
         .instance()
-        .get(&StorageKey::VelocityWindowStart)
+        .get(&StorageKey::VelWinSt)
         .unwrap_or(now);
     let mut accumulator: i128 = env
         .storage()
         .instance()
-        .get(&StorageKey::VelocityAccumulator)
+        .get(&StorageKey::VelAccum)
         .unwrap_or(0);
 
     // Reset window if it has expired.
     if now.saturating_sub(window_start) >= VELOCITY_WINDOW_SECS {
         env.storage()
             .instance()
-            .set(&StorageKey::VelocityWindowStart, &now);
+            .set(&StorageKey::VelWinSt, &now);
         accumulator = 0;
     }
 
     accumulator = accumulator.saturating_add(amount);
     env.storage()
         .instance()
-        .set(&StorageKey::VelocityAccumulator, &accumulator);
+        .set(&StorageKey::VelAccum, &accumulator);
 
     let tvl: i128 = env
         .storage()
         .instance()
-        .get(&StorageKey::TvlSnapshot)
+        .get(&StorageKey::TvlSnap)
         .unwrap_or(0);
 
     if tvl > 0 {
@@ -248,7 +248,7 @@ pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> bool {
         if drain_bps >= TVL_DRAIN_BPS {
             env.storage()
                 .instance()
-                .set(&StorageKey::SoftPaused, &true);
+                .set(&StorageKey::SoftPa, &true);
             return false; // velocity limit breached; SoftPause engaged
         }
     }
@@ -260,7 +260,7 @@ pub fn record_withdrawal_velocity(env: &Env, amount: i128) -> bool {
 pub fn is_soft_paused(env: &Env) -> bool {
     env.storage()
         .instance()
-        .get(&StorageKey::SoftPaused)
+        .get(&StorageKey::SoftPa)
         .unwrap_or(false)
 }
 
@@ -269,15 +269,15 @@ pub fn resume_after_velocity_check(env: &Env, admin: &Address) {
     admin.require_auth();
     env.storage()
         .instance()
-        .set(&StorageKey::SoftPaused, &false);
+        .set(&StorageKey::SoftPa, &false);
     // Reset the velocity window so the 6-hour clock starts fresh.
     let now: u64 = env.ledger().timestamp();
     env.storage()
         .instance()
-        .set(&StorageKey::VelocityWindowStart, &now);
+        .set(&StorageKey::VelWinSt, &now);
     env.storage()
         .instance()
-        .set(&StorageKey::VelocityAccumulator, &0_i128);
+        .set(&StorageKey::VelAccum, &0_i128);
 }
 
 // ── Mass Milestone Dispute Trigger (Sybil-Dispute Attack Protection) ─────────
@@ -293,22 +293,22 @@ pub fn record_dispute(env: &Env, active_grants_count: u32) -> bool {
     let window_start: u64 = env
         .storage()
         .instance()
-        .get(&StorageKey::DisputeWindowStart)
+        .get(&StorageKey::DispWin)
         .unwrap_or(now);
     let mut accumulator: u32 = env
         .storage()
         .instance()
-        .get(&StorageKey::DisputeAccumulator)
+        .get(&StorageKey::DispAcc)
         .unwrap_or(0);
 
     // Reset window if it has expired (24 hours).
     if now.saturating_sub(window_start) >= DISPUTE_WINDOW_SECS {
         env.storage()
             .instance()
-            .set(&StorageKey::DisputeWindowStart, &now);
+            .set(&StorageKey::DispWin, &now);
         env.storage()
             .instance()
-            .set(&StorageKey::ActiveGrantsSnapshot, &active_grants_count);
+            .set(&StorageKey::ActGntSn, &active_grants_count);
         accumulator = 0;
     }
 
@@ -316,19 +316,19 @@ pub fn record_dispute(env: &Env, active_grants_count: u32) -> bool {
     if accumulator == 0 {
         env.storage()
             .instance()
-            .set(&StorageKey::ActiveGrantsSnapshot, &active_grants_count);
+            .set(&StorageKey::ActGntSn, &active_grants_count);
     }
 
     accumulator = accumulator.saturating_add(1);
     env.storage()
         .instance()
-        .set(&StorageKey::DisputeAccumulator, &accumulator);
+        .set(&StorageKey::DispAcc, &accumulator);
 
     // Check if disputes exceed 15% of active grants
     let snapshot_grants: u32 = env
         .storage()
         .instance()
-        .get(&StorageKey::ActiveGrantsSnapshot)
+        .get(&StorageKey::ActGntSn)
         .unwrap_or(active_grants_count);
 
     if snapshot_grants > 0 {
@@ -341,7 +341,7 @@ pub fn record_dispute(env: &Env, active_grants_count: u32) -> bool {
             // Trip the circuit breaker - halt new grant initializations
             env.storage()
                 .instance()
-                .set(&StorageKey::GrantInitializationHalted, &true);
+                .set(&StorageKey::GntHalt, &true);
             return false; // threshold breached; grant initialization halted
         }
     }
@@ -353,7 +353,7 @@ pub fn record_dispute(env: &Env, active_grants_count: u32) -> bool {
 pub fn is_grant_initialization_halted(env: &Env) -> bool {
     env.storage()
         .instance()
-        .get(&StorageKey::GrantInitializationHalted)
+        .get(&StorageKey::GntHalt)
         .unwrap_or(false)
 }
 
@@ -364,18 +364,18 @@ pub fn resume_grant_initialization(env: &Env, admin: &Address) {
     admin.require_auth();
     env.storage()
         .instance()
-        .set(&StorageKey::GrantInitializationHalted, &false);
+        .set(&StorageKey::GntHalt, &false);
     // Reset the dispute window so the 24-hour clock starts fresh.
     let now: u64 = env.ledger().timestamp();
     env.storage()
         .instance()
-        .set(&StorageKey::DisputeWindowStart, &now);
+        .set(&StorageKey::DispWin, &now);
     env.storage()
         .instance()
-        .set(&StorageKey::DisputeAccumulator, &0_u32);
+        .set(&StorageKey::DispAcc, &0_u32);
     env.storage()
         .instance()
-        .set(&StorageKey::ActiveGrantsSnapshot, &0_u32);
+        .set(&StorageKey::ActGntSn, &0_u32);
 }
 
 /// Get current dispute monitoring statistics for transparency.
@@ -383,19 +383,68 @@ pub fn get_dispute_monitoring_stats(env: &Env) -> (u64, u32, u32, bool) {
     let window_start: u64 = env
         .storage()
         .instance()
-        .get(&StorageKey::DisputeWindowStart)
+        .get(&StorageKey::DispWin)
         .unwrap_or(0);
     let dispute_count: u32 = env
         .storage()
         .instance()
-        .get(&StorageKey::DisputeAccumulator)
+        .get(&StorageKey::DispAcc)
         .unwrap_or(0);
     let active_grants_snapshot: u32 = env
         .storage()
         .instance()
-        .get(&StorageKey::ActiveGrantsSnapshot)
+        .get(&StorageKey::ActGntSn)
         .unwrap_or(0);
     let halted: bool = is_grant_initialization_halted(env);
 
     (window_start, dispute_count, active_grants_snapshot, halted)
+}
+
+/// Check if a function is allowed to execute based on rent preservation mode
+pub fn is_function_allowed(env: &Env, is_admin_call: bool) -> bool {
+    // Admin calls are always allowed
+    if is_admin_call {
+        return true;
+    }
+    
+    // Check if rent preservation mode is active
+    !is_rent_preservation_mode(env)
+}
+
+/// Check current rent balance and enable preservation mode if needed
+pub fn check_rent_balance(env: &Env) {
+    let current_balance = get_current_xlm_balance(env);
+    let threshold = get_rent_buffer_threshold(env);
+    
+    if current_balance < threshold {
+        // Enable rent preservation mode
+        env.storage().instance().set(&StorageKey::RentMode, &true);
+    }
+}
+
+/// Check if rent preservation mode is currently active
+pub fn is_rent_preservation_mode(env: &Env) -> bool {
+    env.storage().instance().get(&StorageKey::RentMode).unwrap_or(false)
+}
+
+/// Get current XLM balance of the contract
+pub fn get_current_xlm_balance(env: &Env) -> i128 {
+    // This would need to be implemented to check actual XLM balance
+    // For now, return a placeholder
+    1000000000 // 1000 XLM in stroops
+}
+
+/// Get the rent buffer threshold
+pub fn get_rent_buffer_threshold(env: &Env) -> i128 {
+    env.storage().instance().get(&StorageKey::RentThres).unwrap_or(500000000) // 500 XLM default
+}
+
+/// Disable rent preservation mode (admin only)
+pub fn disable_rent_preservation_mode(env: &Env, admin: &Address) {
+    // Verify admin
+    let contract_admin: Address = env.storage().instance().get(&StorageKey::Admin).unwrap();
+    admin.require_auth();
+    assert_eq!(admin, &contract_admin, "Unauthorized");
+    
+    env.storage().instance().set(&StorageKey::RentMode, &false);
 }

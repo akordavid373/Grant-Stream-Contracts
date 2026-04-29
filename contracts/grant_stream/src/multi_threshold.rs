@@ -285,7 +285,7 @@ pub fn execute_rescue(env: &Env, caller: Address, proposal_id: u64) -> (Address,
     
     // Log gas buffer usage for monitoring
     env.events().publish(
-        (symbol_short!("gas_buffer"), proposal_id),
+        (symbol_short!("gas_buff"), proposal_id),
         (required_buffer, current_gas),
     );
 
