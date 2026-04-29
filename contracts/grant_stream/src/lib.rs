@@ -37,6 +37,9 @@ pub mod multi_threshold;
 #[cfg(test)]
 mod test_dispute_circuit_breaker;
 
+#[cfg(test)]
+mod test_trustline_validation;
+
 // --- Types ---
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
