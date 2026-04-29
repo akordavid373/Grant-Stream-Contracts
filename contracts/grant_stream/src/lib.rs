@@ -13,6 +13,7 @@ pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
 pub const SEP38_STALENESS_SECONDS: u64 = 5 * 60;
 const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+const ZK_COMMITMENT_MODULUS: i128 = 170_141_183_460_469_231_731_687_303_715_884_105_727i128;
 // Minimum claimable balance required before a withdrawal is permitted (1 USDC in 7-decimal units)
 pub const MIN_WITHDRAWAL: i128 = 10_000_000;
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
@@ -149,6 +150,12 @@ pub struct ClaimFiatValue {
 // All runtime storage uses `StorageKey` directly.
 type DataKey = StorageKey;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+enum ConfidentialNullifierKey {
+    Claim(Bytes),
+}
+
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u32)]
@@ -175,6 +182,7 @@ pub enum GrantStreamError {
     OracleFrozen = 20,
     RentPreservationMode = 21,
     InvalidTimestamp = 22,
+    InvalidZKProof = 23,
 }
 
 pub type Error = GrantStreamError;
@@ -334,6 +342,69 @@ fn write_expected_milestone_nonce(env: &Env, grant_id: u64, next_nonce: u64) {
     env.storage()
         .instance()
         .set(&DataKey::MilestoneSubmitNonce(grant_id), &next_nonce);
+}
+
+fn read_confidential_commitment(env: &Env, grant_id: u64) -> Result<i128, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ConfidentialGrantCommitment(grant_id))
+        .ok_or(Error::GrantNotFound)
+}
+
+fn write_confidential_commitment(env: &Env, grant_id: u64, commitment: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ConfidentialGrantCommitment(grant_id), &commitment);
+}
+
+fn read_confidential_recipient(env: &Env, grant_id: u64) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ConfidentialGrantRecipient(grant_id))
+        .ok_or(Error::GrantNotFound)
+}
+
+#[inline]
+fn verify_confidential_claim_proof(
+    env: &Env,
+    grant_id: u64,
+    commitment_before: i128,
+    claim_amount: i128,
+    nullifier: &Bytes,
+    proof: &Bytes,
+) -> Result<i128, Error> {
+    if claim_amount <= 0 || commitment_before <= 0 {
+        return Err(Error::InvalidZKProof);
+    }
+    let verifier_key_hash: Bytes = env
+        .storage()
+        .instance()
+        .get(&DataKey::ConfidentialGrantVerifierKeyHash(grant_id))
+        .ok_or(Error::InvalidZKProof)?;
+    let claim_commitment = claim_amount
+        .checked_rem_euclid(ZK_COMMITMENT_MODULUS)
+        .ok_or(Error::MathOverflow)?;
+    if claim_commitment > commitment_before {
+        return Err(Error::InvalidZKProof);
+    }
+    let commitment_after = commitment_before
+        .checked_sub(claim_commitment)
+        .ok_or(Error::MathOverflow)?;
+
+    let mut public_inputs = Bytes::new(env);
+    for byte in grant_id.to_be_bytes() {
+        public_inputs.push_back(byte);
+    }
+    public_inputs.append(&commitment_before.to_xdr(env));
+    public_inputs.append(&commitment_after.to_xdr(env));
+    public_inputs.append(&claim_amount.to_xdr(env));
+    public_inputs.append(nullifier);
+    public_inputs.append(&verifier_key_hash);
+    let expected_proof: Bytes = env.crypto().sha256(&public_inputs).into();
+    if proof != &expected_proof {
+        return Err(Error::InvalidZKProof);
+    }
+    Ok(commitment_after)
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -685,6 +756,77 @@ impl GrantStreamContract {
             total_amount,
         );
 
+        Ok(())
+    }
+
+    pub fn create_confidential_grant(
+        env: Env,
+        grant_id: u64,
+        recipient: Address,
+        amount_commitment: i128,
+        verifier_key_hash: Bytes,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if amount_commitment <= 0 || amount_commitment >= ZK_COMMITMENT_MODULUS {
+            return Err(Error::InvalidAmount);
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::ConfidentialGrantCommitment(grant_id))
+        {
+            return Err(Error::GrantAlreadyExists);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ConfidentialGrantRecipient(grant_id), &recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::ConfidentialGrantVerifierKeyHash(grant_id), &verifier_key_hash);
+        write_confidential_commitment(&env, grant_id, amount_commitment);
+        env.events().publish((symbol_short!("cnfgrant"), grant_id), amount_commitment);
+        Ok(())
+    }
+
+    pub fn confidential_claim(
+        env: Env,
+        grant_id: u64,
+        claim_amount: i128,
+        nullifier: Bytes,
+        proof: Bytes,
+    ) -> Result<(), Error> {
+        let recipient = read_confidential_recipient(&env, grant_id)?;
+        recipient.require_auth();
+
+        let nullifier_key = ConfidentialNullifierKey::Claim(nullifier.clone());
+        if env.storage().temporary().has(&nullifier_key) {
+            return Err(Error::InvalidZKProof);
+        }
+
+        let commitment_before = read_confidential_commitment(&env, grant_id)?;
+        let commitment_after = verify_confidential_claim_proof(
+            &env,
+            grant_id,
+            commitment_before,
+            claim_amount,
+            &nullifier,
+            &proof,
+        )?;
+        write_confidential_commitment(&env, grant_id, commitment_after);
+
+        env.storage().temporary().set(&nullifier_key, &true);
+        env.storage().temporary().extend_ttl(&nullifier_key, 0, 17280);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &recipient, &claim_amount);
+
+        let mut masked_input = Bytes::new(&env);
+        masked_input.append(&nullifier);
+        masked_input.append(&claim_amount.to_xdr(&env));
+        let masked_amount: Bytes = env.crypto().sha256(&masked_input).into();
+        env.events()
+            .publish((symbol_short!("cnfclaim"),), (nullifier, masked_amount));
         Ok(())
     }
 
