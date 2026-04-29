@@ -1,5 +1,5 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
 };
 
 #[contract]
@@ -55,6 +55,7 @@ pub struct Grant {
 pub enum DataKey {
     Admin,
     Grant(u64),
+    MilestoneEvidence(u64),
 }
 
 #[contracterror]
@@ -73,6 +74,7 @@ pub enum Error {
     InvalidStatusTransition = 10, // New error for invalid status transitions
     SoftPaused = 11,
     OracleFrozen = 12,
+    EvidenceRequired = 13,
 }
 
 pub fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -97,6 +99,20 @@ pub fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
 
 pub fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
     env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+}
+
+fn read_milestone_evidence(env: &Env, grant_id: u64) -> Option<String> {
+    env.storage().instance().get(&DataKey::MilestoneEvidence(grant_id))
+}
+
+fn write_milestone_evidence(env: &Env, grant_id: u64, anchor: &String) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MilestoneEvidence(grant_id), anchor);
+}
+
+fn clear_milestone_evidence(env: &Env, grant_id: u64) {
+    env.storage().instance().remove(&DataKey::MilestoneEvidence(grant_id));
 }
 
 pub fn validate_status_transition(current_mask: u32, new_mask: u32) -> Result<(), Error> {
@@ -479,17 +495,47 @@ impl GrantContract {
         }
         grant.milestone_deadline = deadline;
         grant.milestone_met = false;
+        clear_milestone_evidence(&env, grant_id);
         write_grant(&env, grant_id, &grant);
         Ok(())
     }
 
+    /// Anchor milestone review evidence on-chain. The grant recipient must
+    /// submit a non-empty evidence anchor before the admin can approve the
+    /// milestone as met.
+    pub fn submit_milestone_evidence(env: Env, grant_id: u64, anchor: String) -> Result<(), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
+            return Err(Error::InvalidState);
+        }
+
+        if anchor.len() == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        write_milestone_evidence(&env, grant_id, &anchor);
+        env.events().publish(
+            (symbol_short!("milestone_anchor"),),
+            (grant_id, anchor.clone()),
+        );
+        Ok(())
+    }
+
     /// Mark a milestone as met. After this call the admin can no longer claw
-    /// back the accrued balance based on deadline.
+    /// back the accrued balance based on deadline. Evidence anchoring is
+    /// required before approval.
     pub fn mark_milestone_met(env: Env, grant_id: u64) -> Result<(), Error> {
         require_admin_auth(&env)?;
         let mut grant = read_grant(&env, grant_id)?;
         if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
             return Err(Error::InvalidState);
+        }
+        let evidence = read_milestone_evidence(&env, grant_id)
+            .ok_or(Error::EvidenceRequired)?;
+        if evidence.len() == 0 {
+            return Err(Error::EvidenceRequired);
         }
         grant.milestone_met = true;
         write_grant(&env, grant_id, &grant);
