@@ -262,6 +262,12 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
 /// When no validator is set the full amount goes to the grantee.
 fn apply_accrued_split(grant: &mut Grant, accrued: i128) -> Result<(), Error> {
     if grant.validator.is_some() && accrued > 0 {
+        // ROUNDING BEHAVIOR: Integer division with checked_div truncates toward zero
+        // (rounds down for positive numbers). This is INTENTIONAL and CORRECT.
+        // It ensures the contract always retains any fractional remainder, preventing
+        // the "Point One Cent" exploit where rounding up could slowly drain the contract
+        // beyond its obligations over many transactions.
+        // See test_point_one_cent_exploit.rs for comprehensive proof.
         let validator_share = accrued
             .checked_mul(500)
             .ok_or(Error::MathOverflow)?
@@ -458,6 +464,9 @@ fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Erro
     let base_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
 
     let multiplier = calculate_warmup_multiplier(grant, now);
+    // ROUNDING BEHAVIOR: Division rounds down (truncates toward zero).
+    // This ensures accrued amounts never exceed what should be paid out,
+    // maintaining the contract's solvency. See test_point_one_cent_exploit.rs.
     let accrued = base_accrued
         .checked_mul(multiplier)
         .ok_or(Error::MathOverflow)?
@@ -1472,5 +1481,7 @@ mod test_temporal_fuzz;
 mod test_global_invariant_fuzz;
 #[cfg(test)]
 mod test_security_invariants;
+#[cfg(test)]
+mod test_point_one_cent_exploit;
 #[cfg(test)]
 mod is_active_grantee_benchmark;
