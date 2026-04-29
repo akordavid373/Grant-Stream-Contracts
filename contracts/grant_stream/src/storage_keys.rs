@@ -47,6 +47,12 @@ pub enum StorageKey {
     Milestone(u64, u32),
     /// Expected monotonic nonce for off-chain milestone proof submission
     MilestoneSubmitNonce(u64),
+    /// Confidential grant amount commitment keyed by grant ID
+    ConfidentialGrantCommitment(u64),
+    /// Confidential grant recipient keyed by grant ID
+    ConfidentialGrantRecipient(u64),
+    /// Verifier key hash used for confidential claim proof checks
+    ConfidentialGrantVerifierKeyHash(u64),
     /// Grant streaming metadata and configuration
     GrantStreamConfig(u64),
     /// Grant legal compliance data (hashes, signatures)
@@ -278,6 +284,9 @@ impl StorageKey {
             StorageKey::Grant(_)
             | StorageKey::Milestone(_, _)
             | StorageKey::MilestoneSubmitNonce(_)
+            | StorageKey::ConfidentialGrantCommitment(_)
+            | StorageKey::ConfidentialGrantRecipient(_)
+            | StorageKey::ConfidentialGrantVerifierKeyHash(_)
             | StorageKey::GrantStreamConfig(_)
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
@@ -405,6 +414,10 @@ impl StorageKey {
             
             StorageKey::Grant(_) => "Individual grant data and metadata",
             StorageKey::Milestone(_, _) => "Grant milestone information",
+            StorageKey::MilestoneSubmitNonce(_) => "Expected nonce for milestone proof submission",
+            StorageKey::ConfidentialGrantCommitment(_) => "Commitment for confidential grant amount",
+            StorageKey::ConfidentialGrantRecipient(_) => "Recipient authorized for confidential grant claims",
+            StorageKey::ConfidentialGrantVerifierKeyHash(_) => "Verifier key hash for confidential claim proofs",
             StorageKey::GrantStreamConfig(_) => "Grant streaming configuration",
             StorageKey::GrantLegalData(_) => "Grant legal compliance data",
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
