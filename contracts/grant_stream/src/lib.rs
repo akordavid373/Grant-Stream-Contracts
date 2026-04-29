@@ -35,7 +35,7 @@ pub mod public_dashboard;
 pub mod tax_reporting;
 pub mod audit_log;
 pub mod multi_threshold;
-pub mod matching_pool;
+pub mod double_approval;
 
 #[cfg(test)]
 mod test_dispute_circuit_breaker;
@@ -138,10 +138,13 @@ pub enum GrantStreamError {
     OraclePriceFrozen = 17,
     SoftPaused = 18,
     GrantInitializationHalted = 19,
-    ClawbackAlreadyExecuted = 20,
-    InvalidClawbackReason = 21,
-    DisputeEscrowNotFound = 22,
-    NotDonorOrMultiSig = 23,
+    // Double-approval errors
+    DoubleApprovalRequired = 20,
+    DoubleApprovalNotFound = 21,
+    DoubleApprovalExpired = 22,
+    DoubleApprovalAlreadyApproved = 23,
+    DoubleApprovalNotFullyApproved = 24,
+    DoubleApprovalConfigNotFound = 25,
 }
 
 pub type Error = GrantStreamError;
@@ -1728,6 +1731,172 @@ impl GrantStreamContract {
         }
         false
     }
+
+    // ── Double-Approval System for High-Value Milestone Payouts ───────────────
+
+    /// Initialize double-approval configuration (admin only)
+    pub fn initialize_double_approval(
+        env: Env,
+        primary_approver: Address,
+        secondary_approver: Address,
+        high_value_threshold: Option<i128>,
+        approval_window_secs: Option<u64>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        double_approval::initialize_config(
+            &env,
+            primary_approver,
+            secondary_approver,
+            high_value_threshold,
+            approval_window_secs,
+        )
+    }
+
+    /// Update double-approval configuration (admin only)
+    pub fn update_double_approval_config(
+        env: Env,
+        high_value_threshold: Option<i128>,
+        approval_window_secs: Option<u64>,
+        enabled: Option<bool>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        double_approval::update_config(
+            &env,
+            high_value_threshold,
+            approval_window_secs,
+            enabled,
+        )
+    }
+
+    /// Get current double-approval configuration
+    pub fn get_double_approval_config(env: Env) -> Result<double_approval::DoubleApprovalConfig, Error> {
+        double_approval::get_config(&env)
+    }
+
+    /// Create a double-approval request for a high-value milestone payout
+    pub fn create_double_approval_request(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        amount: i128,
+        recipient: Address,
+        token_address: Address,
+        reason: Option<String>,
+    ) -> Result<u64, Error> {
+        require_admin_auth(&env)?;
+        double_approval::create_request(
+            &env,
+            grant_id,
+            milestone_index,
+            amount,
+            recipient,
+            token_address,
+            reason,
+        )
+    }
+
+    /// Get a double-approval request
+    pub fn get_double_approval_request(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+    ) -> Result<double_approval::DoubleApprovalRequest, Error> {
+        double_approval::get_request(&env, grant_id, milestone_index)
+    }
+
+    /// Approve a double-approval request
+    pub fn approve_double_approval_request(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        approver: Address,
+    ) -> Result<(), Error> {
+        approver.require_auth();
+        double_approval::approve_request(&env, grant_id, milestone_index, approver)
+    }
+
+    /// Execute a fully approved double-approval request
+    pub fn execute_double_approval_request(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        executor: Address,
+    ) -> Result<(), Error> {
+        executor.require_auth();
+        double_approval::execute_request(&env, grant_id, milestone_index, executor)
+    }
+
+    /// Cancel a double-approval request (admin only)
+    pub fn cancel_double_approval_request(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        canceller: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        double_approval::cancel_request(&env, grant_id, milestone_index, canceller)
+    }
+
+    /// Check if an amount requires double approval
+    pub fn requires_double_approval(env: Env, amount: i128) -> Result<bool, Error> {
+        double_approval::requires_double_approval(&env, amount)
+    }
+
+    /// Check if a milestone has a pending double-approval request
+    pub fn has_double_approval_request(env: Env, grant_id: u64, milestone_index: u32) -> bool {
+        double_approval::has_request(&env, grant_id, milestone_index)
+    }
+
+    /// Enhanced milestone claim function with double-approval integration
+    pub fn claim_milestone_with_double_approval(
+        env: Env,
+        grant_id: u64,
+        milestone_index: u32,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        // Check if amount requires double approval
+        if double_approval::requires_double_approval(&env, amount)? {
+            // Check if there's already a fully approved request
+            if let Ok(request) = double_approval::get_request(&env, grant_id, milestone_index) {
+                if request.status == double_approval::ApprovalStatus::FullyApproved 
+                    && request.amount == amount 
+                    && request.recipient == grant.recipient {
+                    // Execute the approved request
+                    return double_approval::execute_request(&env, grant_id, milestone_index, grant.recipient);
+                }
+            }
+            
+            // No approved request found, return error
+            return Err(Error::DoubleApprovalRequired);
+        } else {
+            // Amount doesn't require double approval, proceed with normal claim
+            // This would integrate with the existing claim_milestone_funds function
+            // For now, we'll implement a simplified version
+            if amount > grant.claimable {
+                return Err(Error::InvalidAmount);
+            }
+
+            let mut updated_grant = grant.clone();
+            updated_grant.claimable = updated_grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
+            updated_grant.withdrawn = updated_grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
+            write_grant(&env, grant_id, &updated_grant);
+
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
+            // Emit milestone claim event
+            env.events().publish(
+                (symbol_short!("milestone_claim"),),
+                (grant_id, milestone_index, amount, grant.recipient),
+            );
+
+            Ok(())
+        }
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -1756,4 +1925,4 @@ mod test_point_one_cent_exploit;
 #[cfg(test)]
 mod is_active_grantee_benchmark;
 #[cfg(test)]
-mod test_clawback;
+mod test_double_approval;

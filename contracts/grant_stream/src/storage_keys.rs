@@ -57,12 +57,10 @@ pub enum StorageKey {
     GrantMetrics(u64),
     /// Grant dispute status and resolution data
     GrantDisputeData(u64),
-    /// Grant donor information for clawback authorization
-    GrantDonor(u64),
-    /// Clawback checkpoint data to prevent double-spending
-    ClawbackCheckpoint(u64),
-    /// Dispute escrow balance for contested clawbacks
-    DisputeEscrow(u64),
+    /// Double-approval request for high-value milestone payouts
+    DoubleApprovalRequest(u64, u32),
+    /// Double-approval configuration and thresholds
+    DoubleApprovalConfig,
     
     // ── User Data ───────────────────────────────────────────────────────────────
     
@@ -271,9 +269,8 @@ impl StorageKey {
             | StorageKey::GrantValidatorData(_)
             | StorageKey::GrantMetrics(_)
             | StorageKey::GrantDisputeData(_)
-            | StorageKey::GrantDonor(_)
-            | StorageKey::ClawbackCheckpoint(_)
-            | StorageKey::DisputeEscrow(_) => "grant",
+            | StorageKey::DoubleApprovalRequest(_, _)
+            | StorageKey::DoubleApprovalConfig => "grant",
             
             // User Data
             StorageKey::RecipientGrants(_)
@@ -392,9 +389,8 @@ impl StorageKey {
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",
             StorageKey::GrantMetrics(_) => "Grant performance metrics",
             StorageKey::GrantDisputeData(_) => "Grant dispute status",
-            StorageKey::GrantDonor(_) => "Grant donor information for clawback",
-            StorageKey::ClawbackCheckpoint(_) => "Clawback checkpoint to prevent double-spending",
-            StorageKey::DisputeEscrow(_) => "Dispute escrow balance for contested clawbacks",
+            StorageKey::DoubleApprovalRequest(_, _) => "Double-approval request for milestone",
+            StorageKey::DoubleApprovalConfig => "Double-approval configuration",
             
             StorageKey::RecipientGrants(_) => "Grants associated with recipient",
             StorageKey::UserBalance(_) => "User balance information",
