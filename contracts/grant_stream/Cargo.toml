@@ -17,3 +17,4 @@ legacy-tests = []
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1.0"
+ed25519-dalek = "2.2.0"

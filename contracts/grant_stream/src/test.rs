@@ -4,7 +4,7 @@ use super::{GrantStreamContract, GrantStreamContractClient, GrantStatus, SCALING
 use std::println;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env, Symbol,
+    token, Address, Bytes, Env, Symbol, xdr::ToXdr,
 };
 
 fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantStreamContractClient) {
@@ -28,6 +28,27 @@ fn set_timestamp(env: &Env, timestamp: u64) {
     });
 }
 
+fn build_confidential_proof(
+    env: &Env,
+    grant_id: u64,
+    commitment_before: i128,
+    claim_amount: i128,
+    nullifier: &Bytes,
+    verifier_key_hash: &Bytes,
+) -> Bytes {
+    let commitment_after = commitment_before - claim_amount;
+    let mut public_inputs = Bytes::new(env);
+    for byte in grant_id.to_be_bytes() {
+        public_inputs.push_back(byte);
+    }
+    public_inputs.append(&commitment_before.to_xdr(env));
+    public_inputs.append(&commitment_after.to_xdr(env));
+    public_inputs.append(&claim_amount.to_xdr(env));
+    public_inputs.append(nullifier);
+    public_inputs.append(verifier_key_hash);
+    env.crypto().sha256(&public_inputs).into()
+}
+
 #[test]
 fn test_pipeline() {
     let env = Env::default();
@@ -49,6 +70,62 @@ fn test_pipeline() {
     grant_token_admin.mint(&client.address, &total_amount);
 
     client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None, &None);
+}
+
+#[test]
+fn test_milestone_submission_deposit_refunded_on_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, _treasury, _oracle, native_token_addr, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let native_token = token::Client::new(&env, &native_token_addr);
+    let native_token_admin = token::StellarAssetClient::new(&env, &native_token_addr);
+    let grant_id = 77u64;
+    let deposit = 100_000i128;
+
+    native_token_admin.mint(&recipient, &1_000_000i128);
+    client.create_grant(&grant_id, &recipient, &1_000_000i128, &1_000i128, &0u64, &None, &None);
+
+    let recipient_before = native_token.balance(&recipient);
+    let contract_before = native_token.balance(&client.address);
+    client.submit_milestone_proof(&grant_id, &0u32, &Symbol::new(&env, "m0"), &0u64).unwrap();
+    let recipient_after_submit = native_token.balance(&recipient);
+    let contract_after_submit = native_token.balance(&client.address);
+
+    assert_eq!(recipient_after_submit, recipient_before - deposit);
+    assert_eq!(contract_after_submit, contract_before + deposit);
+
+    client.approve_milestone_submission(&grant_id, &0u32).unwrap();
+    let recipient_after_approval = native_token.balance(&recipient);
+    let contract_after_approval = native_token.balance(&client.address);
+
+    assert_eq!(recipient_after_approval, recipient_before);
+    assert_eq!(contract_after_approval, contract_before);
+}
+
+#[test]
+fn test_milestone_submission_deposit_slashed_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, _grant_token_addr, treasury, _oracle, native_token_addr, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let native_token = token::Client::new(&env, &native_token_addr);
+    let native_token_admin = token::StellarAssetClient::new(&env, &native_token_addr);
+    let grant_id = 78u64;
+    let deposit = 100_000i128;
+
+    native_token_admin.mint(&recipient, &1_000_000i128);
+    client.create_grant(&grant_id, &recipient, &1_000_000i128, &1_000i128, &0u64, &None, &None);
+
+    let treasury_before = native_token.balance(&treasury);
+    let contract_before = native_token.balance(&client.address);
+    client.submit_milestone_proof(&grant_id, &0u32, &Symbol::new(&env, "m1"), &0u64).unwrap();
+    client.slash_milestone_submission_deposit(&grant_id, &0u32).unwrap();
+
+    let treasury_after = native_token.balance(&treasury);
+    let contract_after = native_token.balance(&client.address);
+    assert_eq!(treasury_after, treasury_before + deposit);
+    assert_eq!(contract_after, contract_before);
 }
 
 #[test]
@@ -237,6 +314,7 @@ fn test_is_active_grantee_archived_data() {
     // Test with user who had grants but all are now completed/cancelled
     // This simulates the "stale records" edge case
 }
+
 #[test]
 fn test_warmup() {
     let env = Env::default();

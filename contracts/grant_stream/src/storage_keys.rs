@@ -18,7 +18,6 @@
 
 use soroban_sdk::{contracttype, Address, Bytes, String};
 
-/// Unified storage key enum with namespaced categories to prevent collisions
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype(export = false)]
 pub enum StorageKey {
@@ -36,17 +35,25 @@ pub enum StorageKey {
     Oracle,
     /// Global list of all grant IDs for iteration
     GrantIds,
-    /// Contract initialization status and metadata
-    ContractInitialized,
+    /// Initialization marker flag
+    Init,
     
     // ── Grant Management ────────────────────────────────────────────────────────
     
     /// Individual grant data keyed by grant ID
     Grant(u64),
+    /// Lightweight cryptographic tombstone for pruned grants
+    Tombstone(u64),
     /// Grant milestone data keyed by (grant_id, milestone_index)
     Milestone(u64, u32),
     /// Expected monotonic nonce for off-chain milestone proof submission
     MilestoneSubmitNonce(u64),
+    /// Confidential grant amount commitment keyed by grant ID
+    ConfidentialGrantCommitment(u64),
+    /// Confidential grant recipient keyed by grant ID
+    ConfidentialGrantRecipient(u64),
+    /// Verifier key hash used for confidential claim proof checks
+    ConfidentialGrantVerifierKeyHash(u64),
     /// Grant streaming metadata and configuration
     GrantStreamConfig(u64),
     /// Grant legal compliance data (hashes, signatures)
@@ -102,14 +109,14 @@ pub enum StorageKey {
     
     /// Governance proposal data keyed by proposal ID
     Proposal(u64),
-    /// Individual vote data keyed by (voter_address, proposal_id)
-    Vote(Address, u64),
-    /// Voting power allocation for users
-    VotingPower(Address),
-    /// List of all proposal IDs
-    ProposalIds,
-    /// Governance token address for voting
-    GovernanceToken,
+    /// Vote storage keyed by (voter, proposal_id)
+    Vote(VoteKey),
+    /// Voter conviction and power data keyed by address
+    VotePow(Address),
+    /// Global list of proposal IDs
+    PropIds,
+    /// Governance token address
+    GovTok,
     /// Voting threshold configuration
     VotingThreshold,
     /// Quorum requirements for proposals
@@ -187,8 +194,58 @@ pub enum StorageKey {
     
     // ── Multi-Token Operations ─────────────────────────────────────────────────
     
-    /// Wrapped asset data keyed by token address
-    WrappedAsset(Address),
+    /// Last oracle price recorded
+    LastPric,
+    /// Sanity-check oracle address
+    SanityOra,
+    /// Oracle freeze flag due to price deviation
+    OraFrozen,
+    /// TVL snapshot for velocity checks
+    TvlSnap,
+    /// Velocity window start timestamp
+    VelWinSt,
+    /// Velocity accumulator over the window
+    VelAccum,
+    /// Soft pause flag for velocity breaches
+    SoftPa,
+    /// Oracle heartbeat timestamp
+    OraHeart,
+    /// Oracle freeze flag due to heartbeat failure
+    OraFrzHb,
+    /// Manual exchange rate override
+    ManRate,
+    /// Dispute window start timestamp
+    DispWin,
+    /// Dispute count accumulator
+    DispAcc,
+    /// Active grants snapshot for dispute ratio
+    ActGntSn,
+    /// Grant initialization halt flag
+    GntHalt,
+    /// Rent preservation mode flag
+    RentMode,
+    /// Rent buffer threshold configuration
+    RentThres,
+
+    // ── Audit & Reporting ────────────────────────────────────────────────────────
+
+    /// Audit transaction counter
+    AudTxCnt,
+    /// Audit merkle root for log verification
+    AudRoot,
+    /// Individual audit log entry keyed by index
+    AudLog(u64),
+    /// Tax flow history keyed by recipient address
+    TaxHist(Address),
+    /// Compliance metadata
+    ComplDat,
+    /// Regulatory report keyed by report ID
+    RegRep(u64),
+
+    // ── Multi-Token Operations ────────────────────────────────────────────────────
+
+    /// Wrapped asset configuration keyed by token address
+    WrapAst(Address),
     /// Multi-token bridge configuration
     BridgeConfig,
     /// Cross-chain transaction tracking
@@ -260,7 +317,9 @@ pub enum StorageKey {
     ProtocolPauseReason,
 }
 
-impl StorageKey {
+pub type StorageKey = Key;
+
+impl Key {
     /// Returns the namespace category for this storage key
     /// Useful for debugging and storage analysis
     pub fn namespace(&self) -> &'static str {
@@ -276,8 +335,12 @@ impl StorageKey {
             
             // Grant Management
             StorageKey::Grant(_)
+            | StorageKey::Tombstone(_)
             | StorageKey::Milestone(_, _)
             | StorageKey::MilestoneSubmitNonce(_)
+            | StorageKey::ConfidentialGrantCommitment(_)
+            | StorageKey::ConfidentialGrantRecipient(_)
+            | StorageKey::ConfidentialGrantVerifierKeyHash(_)
             | StorageKey::GrantStreamConfig(_)
             | StorageKey::GrantLegalData(_)
             | StorageKey::GrantValidatorData(_)
@@ -391,8 +454,9 @@ impl StorageKey {
             | StorageKey::ProtocolPauseReason => "misc",
         }
     }
-    
-    /// Returns a human-readable description of this storage key
+
+    /// Returns a human-readable description of the storage key
+    /// Useful for debugging and documentation
     pub fn description(&self) -> &'static str {
         match self {
             StorageKey::Admin => "Contract administrator address",
@@ -404,7 +468,12 @@ impl StorageKey {
             StorageKey::ContractInitialized => "Contract initialization status",
             
             StorageKey::Grant(_) => "Individual grant data and metadata",
+            StorageKey::Tombstone(_) => "Cryptographic proof of a pruned grant",
             StorageKey::Milestone(_, _) => "Grant milestone information",
+            StorageKey::MilestoneSubmitNonce(_) => "Expected nonce for milestone proof submission",
+            StorageKey::ConfidentialGrantCommitment(_) => "Commitment for confidential grant amount",
+            StorageKey::ConfidentialGrantRecipient(_) => "Recipient authorized for confidential grant claims",
+            StorageKey::ConfidentialGrantVerifierKeyHash(_) => "Verifier key hash for confidential claim proofs",
             StorageKey::GrantStreamConfig(_) => "Grant streaming configuration",
             StorageKey::GrantLegalData(_) => "Grant legal compliance data",
             StorageKey::GrantValidatorData(_) => "Grant validator rewards data",

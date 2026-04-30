@@ -4,8 +4,9 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
 };
 
+use crate::storage_keys::StorageKey;
 use super::optimized::{
-    GrantContract, Grant, Error, DataKey, read_grant, write_grant, settle_grant,
+    GrantContract, Grant, Error, read_grant, write_grant, settle_grant,
     STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED,
     has_status, set_status, clear_status, read_admin,
 };
@@ -199,7 +200,8 @@ impl SelfTerminateResult {
             return Ok(()); // No transfer needed
         }
 
-        let token_client = token::Client::new(env, &grant.token);
+        let token_address = env.storage().instance().get::<_, Address>(&StorageKey::GrantToken).unwrap();
+        let token_client = token::Client::new(env, &token_address);
         token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
 
         env.events().publish(
@@ -217,7 +219,8 @@ impl SelfTerminateResult {
         }
         
         let admin = read_admin(env)?;
-        let token_client = token::Client::new(env, &grant.token);
+        let token_address = env.storage().instance().get::<_, Address>(&StorageKey::GrantToken).unwrap();
+        let token_client = token::Client::new(env, &token_address);
         token_client.transfer(&env.current_contract_address(), &admin, &amount);
         
         env.events().publish(

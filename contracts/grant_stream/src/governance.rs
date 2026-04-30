@@ -13,7 +13,7 @@ use soroban_sdk::{
     Vec,
     Map,
 };
-use crate::storage_keys::StorageKey;
+use crate::storage_keys::{StorageKey, VoteKey};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -485,7 +485,7 @@ impl GovernanceContract {
 
         env.storage()
             .instance()
-            .set(&GovernanceDataKey::Vote(voter.clone(), proposal_id), &vote);
+            .set(&GovernanceDataKey::Vote(VoteKey(voter.clone(), proposal_id)), &vote);
 
         let conviction_weight = current_conviction
             .checked_mul(weight)
@@ -629,7 +629,7 @@ impl GovernanceContract {
     ) -> Result<Vote, GovernanceError> {
         env.storage()
             .instance()
-            .get(&GovernanceDataKey::Vote(voter, proposal_id))
+            .get(&GovernanceDataKey::Vote(VoteKey(voter, proposal_id)))
             .ok_or(GovernanceError::ProposalNotFound)
     }
 
